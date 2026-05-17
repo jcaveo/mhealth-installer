@@ -3298,13 +3298,23 @@ function renderArchives() {
     ? `<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:20px">No archives yet.</td></tr>`
     : archives.map(a => {
         const dt = new Date(a.archived_at).toLocaleString([], {month:"short",day:"numeric",hour:"numeric",minute:"2-digit"});
+        // a.name was set at archive time (basename). Fall back to deriving it.
+        const fileName = a.name || (a.original_path || "").split("/").filter(Boolean).pop() || "(unknown)";
+        const home = window.__HOME__ || "";
+        const pathDisplay = home && a.original_path && a.original_path.startsWith(home + "/")
+          ? "~/" + a.original_path.slice(home.length + 1)
+          : (a.original_path || "");
         return `<tr>
-          <td><code style="font-size:11px;word-break:break-all">${escapeHtml(a.original_path)}</code><div style="color:var(--muted);font-size:11px;margin-top:2px">archived ${escapeHtml(dt)}</div></td>
+          <td>
+            <div style="font-weight:600;font-size:13px;word-break:break-all">${a.is_dir ? "📁 " : "📄 "}${escapeHtml(fileName)}</div>
+            <code style="font-size:11px;color:var(--muted);word-break:break-all">${escapeHtml(pathDisplay)}</code>
+            <div style="color:var(--muted);font-size:11px;margin-top:2px">archived ${escapeHtml(dt)}</div>
+          </td>
           <td><span class="badge">${escapeHtml(a.remote)}</span></td>
           <td class="num">${fmtBytes(a.size_bytes)}</td>
           <td>
             <button class="tiny" onclick="restoreArchive('${escapeHtml(a.id)}')">Restore</button>
-            <button class="tiny danger" onclick="deleteArchiveItem('${escapeHtml(a.id)}','${escapeHtml(a.original_path)}')">Delete from cloud</button>
+            <button class="tiny danger" onclick="deleteArchiveItem('${escapeHtml(a.id)}','${escapeHtml(fileName)}')">Delete from cloud</button>
           </td>
         </tr>`;
       }).join("");
