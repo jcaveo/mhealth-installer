@@ -4,6 +4,27 @@ Append-only per CLAUDE.md. New entries on top.
 
 ---
 
+## 2026-05-17 — Persist archive jobs across server restarts
+
+**Status:** completed
+**Changes:**
+- New `JOBS_PATH = ~/Library/Application Support/mac-health-watcher/archive-jobs.json` (same dir as the other persisted state)
+- `_jobs_save_locked()` writes the current `ARCHIVE_JOBS` dict atomically (tmp + rename); called from `_job_set()` on every status change AND from `archive_start_job()` after enqueue + prune
+- `_jobs_load_at_startup()` hydrates `ARCHIVE_JOBS` from disk at module import time. Any persisted job whose status is still `queued` or `running` is converted to a new `interrupted` status with a clear error message: "(server restarted mid-job; archive may or may not be on remote)"
+- UI renders `interrupted` with ⚠️ icon (amber color) — visually distinct from ✓ done (green) and ✗ failed (red)
+- Same pruning rule (50 max terminal jobs), now includes `interrupted` in the terminal set
+
+**Why:**
+- Server restarts (launchctl kickstart, reboot, code update) previously dropped the in-memory job history entirely. Users opening the dashboard after a reboot saw an empty jobs panel even though their archive had completed (and was sitting in the archive registry).
+- More importantly: if a server restart happened DURING an upload, the worker thread died — but the user had no signal that anything happened. Now they see ⚠️ interrupted with a clear note that the remote copy may or may not have completed; they can verify in the Archived items panel + re-queue if needed.
+
+**Verified end-to-end:**
+- Queued a test archive → ran → done → JSON written to disk (679 bytes)
+- Restarted server via `launchctl kickstart`
+- After restart, `/cloud/jobs` returned the same job with same id + status preserved
+
+---
+
 ## 2026-05-17 — Background archive jobs (decouple from HTTP request lifetime)
 
 **Status:** completed

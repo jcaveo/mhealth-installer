@@ -1031,12 +1031,54 @@ def archives_remove(entry_id: str) -> dict | None:
 ARCHIVE_JOBS: dict[str, dict] = {}
 _JOBS_LOCK = threading.Lock()
 _JOBS_MAX_KEEP = 50  # prune oldest completed beyond this
+JOBS_PATH = os.path.join(READLATER_DIR, "archive-jobs.json")
+
+
+def _jobs_save_locked() -> None:
+    """Persist ARCHIVE_JOBS to disk. Caller must hold _JOBS_LOCK."""
+    os.makedirs(READLATER_DIR, exist_ok=True)
+    tmp = JOBS_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(list(ARCHIVE_JOBS.values()), f, indent=2)
+        os.replace(tmp, JOBS_PATH)
+    except Exception:
+        # Persistence is best-effort; don't crash the worker on disk failures
+        pass
+
+
+def _jobs_load_at_startup() -> None:
+    """Read persisted jobs into ARCHIVE_JOBS. Mark any queued/running as
+    'interrupted' since the worker threads didn't survive the restart."""
+    if not os.path.exists(JOBS_PATH):
+        return
+    try:
+        with open(JOBS_PATH) as f:
+            data = json.load(f)
+    except Exception:
+        return
+    if not isinstance(data, list):
+        return
+    with _JOBS_LOCK:
+        for j in data:
+            if not isinstance(j, dict) or "id" not in j:
+                continue
+            if j.get("status") in ("queued", "running"):
+                j["status"] = "interrupted"
+                j["ended_at"] = j.get("ended_at") or time.time()
+                j["error"] = (j.get("error") or "") + " (server restarted mid-job; archive may or may not be on remote)"
+            ARCHIVE_JOBS[j["id"]] = j
+
+
+# Hydrate from disk at import time so jobs survive launchctl kickstart / reboot.
+_jobs_load_at_startup()
 
 
 def _job_set(job_id: str, **updates) -> None:
     with _JOBS_LOCK:
         if job_id in ARCHIVE_JOBS:
             ARCHIVE_JOBS[job_id].update(updates)
+            _jobs_save_locked()
 
 
 def _archive_worker(job_id: str, path: str, remote: str) -> None:
@@ -1078,13 +1120,14 @@ def archive_start_job(path: str, remote: str) -> dict:
     }
     with _JOBS_LOCK:
         ARCHIVE_JOBS[job_id] = job
-        # Prune oldest done/failed jobs if we're over the cap
-        done = [(jid, j) for jid, j in ARCHIVE_JOBS.items()
-                if j["status"] in ("done", "failed")]
-        if len(done) > _JOBS_MAX_KEEP:
-            done.sort(key=lambda x: x[1].get("ended_at") or 0)
-            for jid, _ in done[: len(done) - _JOBS_MAX_KEEP]:
+        # Prune oldest terminal jobs if we're over the cap
+        terminal = [(jid, j) for jid, j in ARCHIVE_JOBS.items()
+                    if j["status"] in ("done", "failed", "interrupted")]
+        if len(terminal) > _JOBS_MAX_KEEP:
+            terminal.sort(key=lambda x: x[1].get("ended_at") or 0)
+            for jid, _ in terminal[: len(terminal) - _JOBS_MAX_KEEP]:
                 ARCHIVE_JOBS.pop(jid, None)
+        _jobs_save_locked()
     t = threading.Thread(target=_archive_worker, args=(job_id, path, remote), daemon=True)
     t.start()
     return job
@@ -3834,6 +3877,7 @@ function renderJobs(jobs) {
     if (j.status === "queued") { icon = "⏳"; label = "queued"; color = "#6b7280"; }
     else if (j.status === "running") { icon = "🔄"; label = j.stage === "check" ? "verifying" : "uploading"; color = "#0369a1"; }
     else if (j.status === "done") { icon = "✓"; label = "done"; color = "#16a34a"; }
+    else if (j.status === "interrupted") { icon = "⚠️"; label = "interrupted (server restart)"; color = "#d97706"; }
     else { icon = "✗"; label = "failed"; color = "#dc2626"; }
     const errPart = j.error ? `<div style="color:#dc2626;margin-top:2px;font-size:11px">→ ${escapeHtml(j.error.slice(0, 200))}</div>` : "";
     return `<div style="padding:4px 0;border-top:1px solid #dbeafe">
