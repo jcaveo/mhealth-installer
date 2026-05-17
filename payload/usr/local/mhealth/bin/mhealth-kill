@@ -1330,6 +1330,125 @@ def import_orphan_archive(remote: str, remote_path: str, inferred_name: str,
     return {"ok": True, "entry": entry}
 
 
+def bind_local_path(entry_id: str, local_path: str) -> dict:
+    """Update an archive entry's original_path. Useful for orphan-imported
+    entries that lost their local path (so verify/re-archive/delete-local can work)."""
+    local_path = os.path.expanduser((local_path or "").strip())
+    if not local_path:
+        return {"ok": False, "error": "local_path required"}
+    home = os.path.expanduser("~")
+    if not (local_path == home or local_path.startswith(home + os.sep)):
+        return {"ok": False, "error": "local_path must be under $HOME"}
+    with _ARCHIVES_LOCK:
+        items = _archives_load()
+        for e in items:
+            if e.get("id") == entry_id:
+                e["original_path"] = local_path
+                e.pop("imported", None)  # no longer "orphan-imported" once bound
+                _archives_save(items)
+                return {"ok": True, "entry": e}
+        return {"ok": False, "error": "archive not found"}
+
+
+def verify_archive(entry_id: str, tolerance_bytes: int = 0) -> dict:
+    """Compare local folder/file size vs the cloud copy's size.
+    Returns status: match | mismatch | local_missing | remote_missing | unknown."""
+    items = _archives_load()
+    entry = next((e for e in items if e.get("id") == entry_id), None)
+    if not entry:
+        return {"ok": False, "error": "archive not found"}
+    local_path = os.path.expanduser(entry.get("original_path") or "")
+    remote_target = f"{entry.get('remote')}:{entry.get('remote_path')}"
+
+    remote_size = rclone_size_bytes(remote_target)
+    if remote_size < 0:
+        return {"ok": True, "status": "remote_missing", "local_size": None, "remote_size": None,
+                "local_path": local_path, "remote_target": remote_target,
+                "message": "Cloud copy not found (already deleted? remote path changed?)"}
+
+    if not local_path or not os.path.exists(local_path):
+        return {"ok": True, "status": "local_missing", "local_size": None, "remote_size": remote_size,
+                "local_path": local_path, "remote_target": remote_target,
+                "message": "Local copy not present — only cloud copy remains. Restore to verify."}
+
+    local_size = _du_bytes(local_path, max_seconds=30.0)
+    delta = local_size - remote_size
+    match = abs(delta) <= tolerance_bytes
+    return {
+        "ok": True,
+        "status": "match" if match else "mismatch",
+        "local_size": local_size,
+        "remote_size": remote_size,
+        "delta_bytes": delta,
+        "local_path": local_path,
+        "remote_target": remote_target,
+        "message": ("Sizes match — cloud copy is complete." if match
+                    else f"⚠️ Size mismatch! Local has {abs(delta)} more bytes than cloud — cloud copy is INCOMPLETE."),
+    }
+
+
+def delete_local_for_archive(entry_id: str, force: bool = False) -> dict:
+    """Delete the local copy ONLY if cloud copy is verified complete.
+    force=True skips the verify check (use at your own risk)."""
+    items = _archives_load()
+    entry = next((e for e in items if e.get("id") == entry_id), None)
+    if not entry:
+        return {"ok": False, "error": "archive not found"}
+    local_path = os.path.expanduser(entry.get("original_path") or "")
+    if not local_path or not os.path.exists(local_path):
+        return {"ok": False, "error": "local copy already gone"}
+
+    if not force:
+        v = verify_archive(entry_id)
+        if v.get("status") != "match":
+            return {
+                "ok": False,
+                "error": f"refusing to delete local — verify says: {v.get('status')}",
+                "verify": v,
+            }
+
+    # Delete local
+    try:
+        if os.path.isdir(local_path) and not os.path.islink(local_path):
+            import shutil
+            shutil.rmtree(local_path)
+        else:
+            os.remove(local_path)
+    except Exception as e:
+        return {"ok": False, "error": f"delete failed: {e}"}
+
+    # Mark entry as local-deleted (so UI hides local-related buttons)
+    with _ARCHIVES_LOCK:
+        items = _archives_load()
+        for e in items:
+            if e.get("id") == entry_id:
+                e["local_deleted_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+                break
+        _archives_save(items)
+    return {"ok": True, "message": f"Deleted local copy of {local_path}"}
+
+
+def rearchive_entry(entry_id: str) -> dict:
+    """Delete the (possibly partial) remote copy + the registry entry, then
+    queue a fresh archive job from the local path."""
+    items = _archives_load()
+    entry = next((e for e in items if e.get("id") == entry_id), None)
+    if not entry:
+        return {"ok": False, "error": "archive not found"}
+    local_path = os.path.expanduser(entry.get("original_path") or "")
+    if not local_path or not os.path.exists(local_path):
+        return {"ok": False, "error": "local copy missing — can't re-archive without source"}
+
+    remote = entry.get("remote", "")
+    del_result = delete_archive(entry_id)  # removes remote + registry
+    new_job = archive_start_job(local_path, remote)
+    return {
+        "ok": True,
+        "deleted_old": del_result.get("ok"),
+        "new_job": new_job,
+    }
+
+
 def archives_backfill_sizes() -> dict:
     """One-shot: for any archive with size_bytes <= 0, query rclone size and update."""
     with _ARCHIVES_LOCK:
@@ -3449,9 +3568,15 @@ function renderArchives() {
           <td style="vertical-align:top"><span class="badge">${escapeHtml(a.remote)}</span></td>
           <td class="num" style="vertical-align:top;white-space:nowrap">${fmtBytes(a.size_bytes)}</td>
           <td style="vertical-align:top">
-            <button class="tiny" onclick="restoreArchive('${escapeHtml(a.id)}')" title="Download back to original path">Restore</button>
-            <button class="tiny" onclick="openInCloud('${escapeHtml(a.remote)}', '${escapeHtml(remotePathDisplay)}')" title="Open ${escapeHtml(a.remote)} web UI in browser">🔗 Open in cloud</button>
-            <button class="tiny danger" onclick="deleteArchiveItem('${escapeHtml(a.id)}','${escapeHtml(fileName)}')" title="Remove remote copy + registry entry">Delete from cloud</button>
+            <div style="display:flex;flex-wrap:wrap;gap:4px">
+              <button class="tiny" onclick="verifyArchive('${escapeHtml(a.id)}')" title="Compare local size vs cloud size — detects partial uploads">✓ Verify</button>
+              <button class="tiny" onclick="restoreArchive('${escapeHtml(a.id)}')" title="Download back to original path">↓ Restore</button>
+              <button class="tiny" onclick="revealLocalIfExists('${escapeHtml(a.original_path)}')" title="Open original local folder in Finder (if still present)">📂 Open local</button>
+              <button class="tiny" onclick="openInCloud('${escapeHtml(a.remote)}', '${escapeHtml(remotePathDisplay)}')" title="Open ${escapeHtml(a.remote)} web UI">🔗 Open cloud</button>
+              <button class="tiny" onclick="rearchive('${escapeHtml(a.id)}','${escapeHtml(fileName)}')" title="Delete remote copy + re-upload fresh from local (fixes partial uploads)">🔄 Re-archive</button>
+              <button class="tiny danger" onclick="deleteLocalSafe('${escapeHtml(a.id)}','${escapeHtml(fileName)}')" title="Verify upload then delete local copy">🗑 Delete local</button>
+              <button class="tiny danger" onclick="deleteArchiveItem('${escapeHtml(a.id)}','${escapeHtml(fileName)}')" title="Remove remote copy + registry entry">Delete from cloud</button>
+            </div>
           </td>
         </tr>`;
       }).join("");
@@ -4193,6 +4318,110 @@ async function deleteArchiveItem(id, name) {
   if (!confirm(`Delete cloud copy of "${name}"?\nThis removes the remote files AND the archive record.\nLocal files (if any) are untouched.`)) return;
   await fetch("/cloud?id=" + encodeURIComponent(id), { method: "DELETE" });
   refreshCloud();
+}
+
+async function revealLocalIfExists(path) {
+  try {
+    const r = await fetch("/reveal?path=" + encodeURIComponent(path));
+    const j = await r.json();
+    if (!j.ok) alert("Couldn't open " + path + " — file may have been deleted or moved.");
+  } catch (e) {
+    alert("Reveal failed: " + e.message);
+  }
+}
+
+async function verifyArchive(id) {
+  try {
+    const r = await fetch("/cloud/verify", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({id}),
+    });
+    const j = await r.json();
+    if (!j.ok) { alert("Verify failed: " + (j.error || "unknown")); return; }
+    let msg = "";
+    if (j.status === "match") {
+      msg = `✓ MATCH — cloud copy is complete.\n\nLocal:  ${fmtBytes(j.local_size)}\nCloud:  ${fmtBytes(j.remote_size)}\n\nSafe to delete local copy.`;
+    } else if (j.status === "mismatch") {
+      const delta = Math.abs(j.delta_bytes);
+      const dir = j.delta_bytes > 0 ? "local has more" : "cloud has more";
+      msg = `⚠️ MISMATCH — upload is INCOMPLETE.\n\nLocal:  ${fmtBytes(j.local_size)}\nCloud:  ${fmtBytes(j.remote_size)}\nDelta:  ${fmtBytes(delta)} (${dir})\n\nDO NOT delete local. Use 🔄 Re-archive to fix.`;
+    } else if (j.status === "local_missing") {
+      // For orphan-imported entries, original_path is "(unknown)" — offer to bind
+      if ((j.local_path || "").includes("(unknown")) {
+        const newPath = prompt(
+          `This archive was imported from cloud without a local path.\n\nCloud has ${fmtBytes(j.remote_size)}.\n\nIf the original local folder/file still exists, paste its path to bind it (e.g. ~/Desktop/Work/Upwork sessions and calls-gigradar) so Verify and Re-archive work:`,
+          "~/"
+        );
+        if (newPath) {
+          const r = await fetch("/cloud/bind-local", {
+            method: "POST", headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({id, local_path: newPath}),
+          });
+          const j2 = await r.json();
+          if (j2.ok) {
+            refreshCloud();
+            setTimeout(() => verifyArchive(id), 500); // re-verify with bound path
+            return;
+          } else {
+            alert("Bind failed: " + (j2.error || "unknown"));
+            return;
+          }
+        }
+        return;
+      }
+      msg = `Local copy is missing.\nCloud has ${fmtBytes(j.remote_size)}.\n\nUse ↓ Restore if you want it back.`;
+    } else if (j.status === "remote_missing") {
+      msg = `Cloud copy missing! ${j.message || ""}`;
+    } else {
+      msg = JSON.stringify(j, null, 2);
+    }
+    alert(msg);
+  } catch (e) {
+    alert("Verify failed: " + e.message);
+  }
+}
+
+async function deleteLocalSafe(id, name) {
+  if (!confirm(`Delete LOCAL copy of "${name}"?\n\nWill first verify the cloud copy is complete.\nIf cloud is incomplete, deletion is refused.\n\nThe remote copy stays — you can Restore later.`)) return;
+  try {
+    const r = await fetch("/cloud/delete-local", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({id}),
+    });
+    const j = await r.json();
+    if (j.ok) {
+      alert(j.message || "Local copy deleted.");
+      refreshCloud();
+      scanFolder();  // rescan in case it was a scanned folder
+    } else if (j.verify) {
+      const v = j.verify;
+      const delta = Math.abs(v.delta_bytes || 0);
+      alert(`Refused to delete — cloud copy is INCOMPLETE!\n\nLocal:  ${fmtBytes(v.local_size)}\nCloud:  ${fmtBytes(v.remote_size)}\nMissing: ${fmtBytes(delta)} on cloud\n\nClick 🔄 Re-archive to upload the missing bytes.`);
+    } else {
+      alert("Delete local failed: " + (j.error || "unknown"));
+    }
+  } catch (e) {
+    alert("Delete failed: " + e.message);
+  }
+}
+
+async function rearchive(id, name) {
+  if (!confirm(`Re-archive "${name}"?\n\nThis will:\n  1. Delete the current cloud copy (may be partial)\n  2. Queue a fresh upload from your local copy\n  3. The new upload runs in the background (see jobs panel)\n\nYour local copy is untouched.`)) return;
+  try {
+    const r = await fetch("/cloud/rearchive", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({id}),
+    });
+    const j = await r.json();
+    if (j.ok) {
+      refreshCloud();
+      startJobsPolling();
+    } else {
+      alert("Re-archive failed: " + (j.error || "unknown"));
+    }
+  } catch (e) {
+    alert("Re-archive failed: " + e.message);
+  }
 }
 
 async function openInCloud(remote, remotePath) {
@@ -5140,6 +5369,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Browser disconnect / refresh won't kill the upload anymore.
             job = archive_start_job(path, remote)
             self._send(200, json.dumps({"ok": True, "job_id": job["id"], "job": job}).encode(), "application/json")
+
+        elif self.path == "/cloud/bind-local":
+            try:
+                payload_in = json.loads(body)
+            except Exception:
+                self._send(400, b'{"ok":false,"error":"invalid json"}', "application/json"); return
+            iid = (payload_in.get("id") or "").strip()
+            local_path = (payload_in.get("local_path") or "").strip()
+            result = bind_local_path(iid, local_path)
+            self._send(200 if result.get("ok") else 400, json.dumps(result).encode(), "application/json")
+
+        elif self.path == "/cloud/verify":
+            try:
+                payload_in = json.loads(body)
+            except Exception:
+                self._send(400, b'{"ok":false,"error":"invalid json"}', "application/json"); return
+            iid = (payload_in.get("id") or "").strip()
+            result = verify_archive(iid)
+            self._send(200, json.dumps(result).encode(), "application/json")
+
+        elif self.path == "/cloud/delete-local":
+            try:
+                payload_in = json.loads(body)
+            except Exception:
+                self._send(400, b'{"ok":false,"error":"invalid json"}', "application/json"); return
+            iid = (payload_in.get("id") or "").strip()
+            force = bool(payload_in.get("force", False))
+            result = delete_local_for_archive(iid, force=force)
+            self._send(200 if result.get("ok") else 409, json.dumps(result).encode(), "application/json")
+
+        elif self.path == "/cloud/rearchive":
+            try:
+                payload_in = json.loads(body)
+            except Exception:
+                self._send(400, b'{"ok":false,"error":"invalid json"}', "application/json"); return
+            iid = (payload_in.get("id") or "").strip()
+            result = rearchive_entry(iid)
+            self._send(200 if result.get("ok") else 400, json.dumps(result).encode(), "application/json")
 
         elif self.path == "/cloud/backfill-sizes":
             result = archives_backfill_sizes()
