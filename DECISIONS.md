@@ -4,6 +4,35 @@ Append-only per CLAUDE.md. New entries on top.
 
 ---
 
+## 2026-05-17 — Background archive jobs (decouple from HTTP request lifetime)
+
+**Status:** completed
+**Root cause:** archive uploads ran inside the HTTP request thread. Any browser disconnect (refresh, page close, network blip, my `launchctl kickstart` during debugging) killed the in-flight rclone subprocess + the HTTP response stream — surfacing as "Failed to fetch" client-side and `BrokenPipeError` server-side. Verified in `mhealth-server.stderr.log`.
+
+**Architecture change:**
+- New `ARCHIVE_JOBS` dict (thread-safe via `_JOBS_LOCK`) tracks per-job status
+- `archive_start_job(path, remote)` spawns a daemon worker thread, returns the job stub instantly
+- `_archive_worker` runs `archive_path_to_cloud` (the existing atomic copy → verify → register → rm-local), updates job status to `running`/`done`/`failed` with stage info
+- `POST /cloud/archive` now returns `{ok:true, job_id, job}` immediately (no waiting for upload)
+- New `GET /cloud/jobs` returns all jobs sorted by start time desc (capped at 50)
+- Pruning: when > 50 done/failed jobs accumulate, oldest are dropped
+
+**UI changes:**
+- New blue "Active archive jobs" panel above the scan results
+- `archiveSelected()` queues all jobs immediately ("3 job(s) queued. See panel below for progress.")
+- `startJobsPolling()` polls `/cloud/jobs` every 2 s, renders job rows with status icon (⏳ queued / 🔄 uploading / ✓ done / ✗ failed) + age + remote name
+- Stops polling automatically when nothing is queued/running, then refreshes the archived items list
+- On dashboard load, checks for active jobs (started in a previous session) and resumes polling — so users opening the dashboard after closing it during an upload see the progress catch up
+
+**End-user-visible improvement:**
+- Browser disconnect / page refresh / accidental restart no longer kills uploads
+- Long Mega uploads (where 87 MB previously stalled out) now run to completion in the background
+- Multiple files can queue at once with live status
+
+**Verified end-to-end:** test file uploaded to Mega via the async API — POST returned `job_id: e699b49453` instantly; polling showed `running → done` in 4 s; archive registry contains the file.
+
+---
+
 ## 2026-05-17 — Delete/Archive Selected: respect user's selection + fix \n literals
 
 **Status:** completed

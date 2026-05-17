@@ -1022,6 +1022,74 @@ def archives_remove(entry_id: str) -> dict | None:
         return None
 
 
+# --- Background archive jobs --------------------------------------------
+# Long uploads (esp. to Mega) can take minutes. We don't want the browser's
+# HTTP connection lifetime to gate the upload — that makes refresh/disconnect
+# fatal. So POST /cloud/archive returns a job_id immediately and the actual
+# rclone work happens in a worker thread. Client polls /cloud/jobs.
+
+ARCHIVE_JOBS: dict[str, dict] = {}
+_JOBS_LOCK = threading.Lock()
+_JOBS_MAX_KEEP = 50  # prune oldest completed beyond this
+
+
+def _job_set(job_id: str, **updates) -> None:
+    with _JOBS_LOCK:
+        if job_id in ARCHIVE_JOBS:
+            ARCHIVE_JOBS[job_id].update(updates)
+
+
+def _archive_worker(job_id: str, path: str, remote: str) -> None:
+    _job_set(job_id, status="running", stage="copy")
+    try:
+        result = archive_path_to_cloud(path, remote)
+    except Exception as e:
+        _job_set(job_id, status="failed", error=str(e), ended_at=time.time())
+        return
+    if result.get("ok"):
+        _job_set(job_id,
+                 status="done",
+                 ended_at=time.time(),
+                 entry=result.get("entry"),
+                 warning=result.get("warning"))
+    else:
+        _job_set(job_id,
+                 status="failed",
+                 ended_at=time.time(),
+                 error=result.get("error"),
+                 stage=result.get("stage"))
+
+
+def archive_start_job(path: str, remote: str) -> dict:
+    """Spawn a background archive thread. Returns the job stub immediately."""
+    import uuid
+    job_id = uuid.uuid4().hex[:10]
+    job = {
+        "id": job_id,
+        "path": path,
+        "name": os.path.basename(path.rstrip("/")) or "root",
+        "remote": remote,
+        "status": "queued",
+        "stage": None,
+        "started_at": time.time(),
+        "ended_at": None,
+        "error": None,
+        "entry": None,
+    }
+    with _JOBS_LOCK:
+        ARCHIVE_JOBS[job_id] = job
+        # Prune oldest done/failed jobs if we're over the cap
+        done = [(jid, j) for jid, j in ARCHIVE_JOBS.items()
+                if j["status"] in ("done", "failed")]
+        if len(done) > _JOBS_MAX_KEEP:
+            done.sort(key=lambda x: x[1].get("ended_at") or 0)
+            for jid, _ in done[: len(done) - _JOBS_MAX_KEEP]:
+                ARCHIVE_JOBS.pop(jid, None)
+    t = threading.Thread(target=_archive_worker, args=(job_id, path, remote), daemon=True)
+    t.start()
+    return job
+
+
 def archive_path_to_cloud(local_path: str, remote: str) -> dict:
     """Atomic: rclone copy → rclone check → record → rm local. Returns result dict."""
     local_path = os.path.expanduser(local_path)
@@ -1988,6 +2056,8 @@ HTML = r"""<!DOCTYPE html>
           <span class="status" id="scanStatus" style="margin-left:auto"></span>
         </div>
         <div id="scanBreadcrumbs" style="display:none;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:8px;font-size:13px;display:flex;align-items:center;gap:6px;flex-wrap:wrap"></div>
+        <!-- Active archive jobs panel — survives browser refresh, polls every 2s -->
+        <div id="archiveJobsPanel" style="display:none;background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:8px 12px;margin-bottom:8px;font-size:12px"></div>
         <div id="scanLegend" style="font-size:12px;color:var(--muted);margin-bottom:8px;display:none">
           <span style="display:inline-block;margin-right:14px">🗑 <b>Delete</b> — regenerable</span>
           <span style="display:inline-block;margin-right:14px">☁️ <b>Archive</b> — cold assets</span>
@@ -3688,30 +3758,109 @@ async function archiveSelected() {
 
   const paths = allSelected.map(cb => cb.dataset.path);
   const status = document.getElementById("scanStatus");
-  let okCount = 0, failed = [];
-  for (let i = 0; i < paths.length; i++) {
-    const p = paths[i];
-    status.textContent = `Archiving ${i+1}/${paths.length}: ${p.split("/").pop()}…`;
-    status.className = "status";
+
+  // Async pattern: kick off N jobs immediately. Each POST returns instantly
+  // with a job_id. The actual rclone upload runs in a server-side worker
+  // thread — browser refresh / disconnect no longer kill it.
+  status.textContent = `Queueing ${paths.length} archive job(s)…`;
+  status.className = "status";
+  let queued = 0, queueFailed = [];
+  for (const p of paths) {
     try {
       const r = await fetch("/cloud/archive", {
         method: "POST", headers: {"Content-Type": "application/json"},
         body: JSON.stringify({path: p, remote}),
       });
       const j = await r.json();
-      if (j.ok) okCount++; else failed.push({path: p, err: j.error});
+      if (j.ok) queued++; else queueFailed.push({path: p, err: j.error});
     } catch (e) {
-      failed.push({path: p, err: e.message});
+      queueFailed.push({path: p, err: e.message});
     }
   }
-  status.textContent = `Archived ${okCount} of ${paths.length}`;
-  status.className = okCount === paths.length ? "status ok" : "status err";
-  if (failed.length) {
-    alert("Some failed:\n\n" + failed.map(f => `${f.path}\n  → ${f.err}`).join("\n\n"));
+  status.textContent = `${queued} job(s) queued. See "Active jobs" panel below for progress.`;
+  status.className = queueFailed.length ? "status err" : "status ok";
+  if (queueFailed.length) {
+    alert("Couldn't queue some items:\n\n" +
+          queueFailed.map(f => `${f.path}\n  → ${f.err}`).join("\n\n"));
   }
-  refreshCloud();
-  scanFolder();
+  // Start polling the jobs panel (idempotent — if already polling, this is a noop)
+  startJobsPolling();
 }
+
+// ---- Jobs polling ----
+let _jobsPollTimer = null;
+
+function startJobsPolling() {
+  if (_jobsPollTimer) return;
+  refreshJobs(); // immediate
+  _jobsPollTimer = setInterval(refreshJobs, 2000);
+}
+
+function stopJobsPolling() {
+  if (_jobsPollTimer) { clearInterval(_jobsPollTimer); _jobsPollTimer = null; }
+}
+
+async function refreshJobs() {
+  let jobs = [];
+  try {
+    const r = await fetch("/cloud/jobs");
+    jobs = (await r.json()).jobs || [];
+  } catch { return; }
+  renderJobs(jobs);
+  // If nothing active, stop polling and refresh archive list
+  const active = jobs.filter(j => j.status === "queued" || j.status === "running");
+  if (active.length === 0 && jobs.length > 0) {
+    stopJobsPolling();
+    refreshCloud();
+  }
+}
+
+function renderJobs(jobs) {
+  const el = document.getElementById("archiveJobsPanel");
+  if (!el) return;
+  if (jobs.length === 0) { el.style.display = "none"; return; }
+
+  const fmtAge = (sec) => {
+    const a = Math.floor(sec);
+    if (a < 60) return a + "s";
+    if (a < 3600) return Math.floor(a/60) + "m " + (a%60) + "s";
+    return Math.floor(a/3600) + "h " + Math.floor((a%3600)/60) + "m";
+  };
+  const now = Date.now() / 1000;
+  const recent = jobs.slice(0, 10);  // show most recent 10
+  const html = recent.map(j => {
+    const age = fmtAge(now - (j.started_at || now));
+    let icon, label, color;
+    if (j.status === "queued") { icon = "⏳"; label = "queued"; color = "#6b7280"; }
+    else if (j.status === "running") { icon = "🔄"; label = j.stage === "check" ? "verifying" : "uploading"; color = "#0369a1"; }
+    else if (j.status === "done") { icon = "✓"; label = "done"; color = "#16a34a"; }
+    else { icon = "✗"; label = "failed"; color = "#dc2626"; }
+    const errPart = j.error ? `<div style="color:#dc2626;margin-top:2px;font-size:11px">→ ${escapeHtml(j.error.slice(0, 200))}</div>` : "";
+    return `<div style="padding:4px 0;border-top:1px solid #dbeafe">
+      <span style="color:${color};font-weight:600">${icon} ${label}</span>
+      <span style="margin:0 6px;color:#6b7280">·</span>
+      <code style="font-size:11px;word-break:break-all">${escapeHtml(j.name || j.path || "")}</code>
+      <span style="margin:0 6px;color:#6b7280">·</span>
+      <span style="color:#6b7280">${escapeHtml(j.remote || "")}</span>
+      <span style="margin:0 6px;color:#6b7280">·</span>
+      <span style="color:#6b7280">${age}</span>
+      ${errPart}
+    </div>`;
+  }).join("");
+  const active = jobs.filter(j => j.status === "queued" || j.status === "running").length;
+  el.innerHTML = `<div style="font-weight:600;color:#1e40af;margin-bottom:4px">Active archive jobs ${active ? `(${active} running)` : "(all complete)"}</div>${html}`;
+  el.style.display = "block";
+}
+
+// Poll jobs whenever Archive tab is opened (catches jobs started in another tab)
+const _origSwitchTab = typeof switchTab === "function" ? switchTab : null;
+// Already handled inside switchTab; jobs polling triggers from archiveSelected
+// and the archive tab activator. Also poll on dashboard load if any active.
+fetch("/cloud/jobs").then(r => r.json()).then(({jobs}) => {
+  if (jobs && jobs.some(j => j.status === "queued" || j.status === "running")) {
+    startJobsPolling();
+  }
+}).catch(() => {});
 
 async function restoreArchive(id) {
   if (!confirm("Restore this archive to its original path?")) return;
@@ -4339,6 +4488,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 result = {"ok": ok, "target": tgt, "items": merged_items,
                           "totals_bytes": merged_totals, "errors": errors}
             self._send(200, json.dumps(result).encode(), "application/json")
+        elif self.path == "/cloud/jobs":
+            with _JOBS_LOCK:
+                jobs = sorted(ARCHIVE_JOBS.values(),
+                              key=lambda j: j.get("started_at", 0), reverse=True)
+            self._send(200, json.dumps({"jobs": jobs}).encode(), "application/json")
         elif self.path == "/cloud/home-overview":
             self._send(200, json.dumps(scan_home_overview()).encode(), "application/json")
         elif self.path == "/cloud/pick-folder":
@@ -4610,9 +4764,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             remote = (payload_in.get("remote") or "").strip()
             if not path or not remote:
                 self._send(400, b'{"ok":false,"error":"path and remote required"}', "application/json"); return
-            # Long-running — rclone copy of GBs can take minutes/hours
-            result = archive_path_to_cloud(path, remote)
-            self._send(200 if result.get("ok") else 500, json.dumps(result).encode(), "application/json")
+            # Async: spawn the rclone copy in a worker thread, return job_id now.
+            # Browser disconnect / refresh won't kill the upload anymore.
+            job = archive_start_job(path, remote)
+            self._send(200, json.dumps({"ok": True, "job_id": job["id"], "job": job}).encode(), "application/json")
 
         elif self.path == "/cloud/restore":
             try:
