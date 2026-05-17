@@ -1222,6 +1222,91 @@ def restore_archive(entry_id: str, *, keep_remote: bool = True) -> dict:
     return {"ok": True, "entry": entry, "kept_remote": keep_remote}
 
 
+def reconcile_remote(remote: str) -> dict:
+    """List the remote archive dir and diff against the local registry.
+    Returns lists of (a) registered+present, (b) orphan_remote (on cloud, not in
+    registry — uploads completed but registry write was lost), (c) missing_local
+    (in registry but not on cloud — files deleted out-of-band)."""
+    if not rclone_available():
+        return {"ok": False, "error": "rclone not installed"}
+    if remote not in {r["name"] for r in rclone_remotes()}:
+        return {"ok": False, "error": f"remote '{remote}' not configured"}
+
+    rc, out, err = rclone_run(["lsjson", f"{remote}:{ARCHIVE_REMOTE_PREFIX}"], timeout=60)
+    if rc != 0:
+        # If the archive dir doesn't exist yet (no archives ever), report empty
+        if "directory not found" in (err or "").lower() or rc == 3:
+            return {"ok": True, "remote": remote, "registered": [], "orphans": [], "missing_local": []}
+        return {"ok": False, "error": f"rclone lsjson failed: {err[:300]}"}
+    try:
+        remote_entries = json.loads(out) if out.strip() else []
+    except Exception as e:
+        return {"ok": False, "error": f"parse error: {e}"}
+
+    local = _archives_load()
+    local_by_remote_path = {a.get("remote_path"): a for a in local if a.get("remote") == remote}
+
+    registered = []
+    orphans = []
+    for entry in remote_entries:
+        name = entry.get("Name", "")
+        is_dir = entry.get("IsDir", False)
+        size = int(entry.get("Size", 0) or 0)
+        remote_path = f"{ARCHIVE_REMOTE_PREFIX}/{name}"
+        if remote_path in local_by_remote_path:
+            registered.append({"remote_path": remote_path, "name": name, "is_dir": is_dir, "size_bytes": size})
+        else:
+            # Try to recover the original filename from the format <ts>-<rand>-<basename>
+            m = re.match(r"^(\d+)-(\d+)-(.+)$", name)
+            inferred_name = m.group(3) if m else name
+            inferred_ts = int(m.group(1)) // 1000 if m else None
+            orphans.append({
+                "remote_path": remote_path,
+                "folder_name": name,
+                "inferred_name": inferred_name,
+                "inferred_timestamp": inferred_ts,
+                "is_dir": is_dir,
+                "size_bytes": size,
+            })
+
+    # Things in registry but not on cloud
+    remote_paths_present = {f"{ARCHIVE_REMOTE_PREFIX}/{e.get('Name', '')}" for e in remote_entries}
+    missing = [a for a in local
+               if a.get("remote") == remote and a.get("remote_path") not in remote_paths_present]
+
+    return {
+        "ok": True,
+        "remote": remote,
+        "registered": registered,
+        "orphans": orphans,
+        "missing_local": missing,
+    }
+
+
+def import_orphan_archive(remote: str, remote_path: str, inferred_name: str,
+                          is_dir: bool, size_bytes: int,
+                          original_path: str | None = None) -> dict:
+    """Import an orphan remote file into the local registry so it shows up in the
+    Archived items UI (and can be Restored / Deleted). The original_path is best-
+    effort — we don't know where it came from unless caller provides it; otherwise
+    we mark it as 'unknown'."""
+    entry_id = remote_path.split("/")[-1].split("-")[0] + "-" + remote_path.split("/")[-1].split("-")[1] \
+        if re.match(r"^.+/\d+-\d+-", remote_path) else f"imported-{int(time.time()*1000)}"
+    entry = {
+        "id": entry_id,
+        "original_path": original_path or f"~/(unknown — imported from {remote})",
+        "name": inferred_name,
+        "remote": remote,
+        "remote_path": remote_path,
+        "size_bytes": size_bytes,
+        "archived_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "is_dir": is_dir,
+        "imported": True,
+    }
+    archives_add(entry)
+    return {"ok": True, "entry": entry}
+
+
 def delete_archive(entry_id: str) -> dict:
     """Remove from cloud + remove registry entry. Does not touch any local file."""
     if not rclone_available():
@@ -2098,6 +2183,11 @@ HTML = r"""<!DOCTYPE html>
           <button class="tiny" onclick="setScanPreset('~/Movies')">~/Movies</button>
           <span class="status" id="scanStatus" style="margin-left:auto"></span>
         </div>
+        <div id="recentScansRow" class="toolbar" style="display:none;margin-bottom:8px;flex-wrap:wrap;font-size:12px">
+          <span style="color:var(--muted)">Recent:</span>
+          <span id="recentScansChips"></span>
+          <button class="tiny" onclick="clearRecentScans()" title="Clear recent history" style="margin-left:auto">Clear</button>
+        </div>
         <div id="scanBreadcrumbs" style="display:none;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:8px;font-size:13px;display:flex;align-items:center;gap:6px;flex-wrap:wrap"></div>
         <!-- Active archive jobs panel — survives browser refresh, polls every 2s -->
         <div id="archiveJobsPanel" style="display:none;background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:8px 12px;margin-bottom:8px;font-size:12px"></div>
@@ -2132,10 +2222,12 @@ HTML = r"""<!DOCTYPE html>
 
       <section>
         <h3 style="margin:0 0 8px;font-size:14px">Archived items <span style="font-weight:400;color:var(--muted);font-size:11px">(in cloud)</span></h3>
-        <div class="toolbar" style="margin-bottom:8px">
+        <div class="toolbar" style="margin-bottom:8px;flex-wrap:wrap">
           <button onclick="refreshCloud()">Refresh</button>
+          <button onclick="reconcileWithCloud()" title="Find files on cloud that aren't in your local registry (e.g., from interrupted uploads)">🔄 Reconcile with cloud</button>
           <span class="status" id="archStatus"></span>
         </div>
+        <div id="reconcileResult" style="display:none;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:12px"></div>
         <table id="archTable">
           <colgroup><col style="width:200px"><col><col style="width:80px"><col style="width:70px"><col style="width:200px"></colgroup>
           <thead><tr><th>Filename</th><th>Original path</th><th>Remote</th><th class="num">Size</th><th></th></tr></thead>
@@ -3329,6 +3421,125 @@ function setScanPreset(path) {
   scanFolder();
 }
 
+// ---- Recent scans (localStorage) ----
+const RECENT_SCANS_KEY = "mhealth.recentScans";
+const RECENT_SCANS_MAX = 6;
+
+function getRecentScans() {
+  try { return JSON.parse(localStorage.getItem(RECENT_SCANS_KEY) || "[]"); }
+  catch { return []; }
+}
+
+function rememberScan(path) {
+  if (!path || path.includes(",")) return;  // skip multi-path entries
+  const recent = getRecentScans().filter(p => p !== path);
+  recent.unshift(path);
+  while (recent.length > RECENT_SCANS_MAX) recent.pop();
+  localStorage.setItem(RECENT_SCANS_KEY, JSON.stringify(recent));
+  renderRecentScans();
+}
+
+function renderRecentScans() {
+  const row = document.getElementById("recentScansRow");
+  const chips = document.getElementById("recentScansChips");
+  if (!row || !chips) return;
+  const recent = getRecentScans();
+  if (recent.length === 0) { row.style.display = "none"; return; }
+  // Don't include presets-row paths in the "recent" list to avoid duplication
+  const presets = new Set(["~/Documents/projects", "~/Desktop", "~/Downloads", "~/Movies"]);
+  const filtered = recent.filter(p => !presets.has(p));
+  if (filtered.length === 0) { row.style.display = "none"; return; }
+  chips.innerHTML = filtered.map(p => {
+    const safe = escapeHtml(p);
+    return `<button class="tiny" onclick="setScanPreset('${safe.replace(/'/g, "\\'")}')" title="${safe}">${safe}</button>`;
+  }).join(" ");
+  row.style.display = "flex";
+}
+
+function clearRecentScans() {
+  localStorage.removeItem(RECENT_SCANS_KEY);
+  renderRecentScans();
+}
+
+// Render on dashboard load
+renderRecentScans();
+
+// ---- Reconcile with cloud (find orphans on remote) ----
+async function reconcileWithCloud() {
+  const remotes = (cloudState.remotes || []).map(r => r.name);
+  if (remotes.length === 0) { alert("No cloud remotes configured — set one up in Cloud Setup tab first."); return; }
+  // If multiple remotes, pick the first one for now; could prompt later
+  const remote = remotes[0];
+  const result = document.getElementById("reconcileResult");
+  result.style.display = "block";
+  result.innerHTML = `<span style="color:var(--muted)">Scanning <code>${escapeHtml(remote)}</code> for archived items… this can take a moment for large clouds.</span>`;
+  try {
+    const r = await fetch("/cloud/reconcile?remote=" + encodeURIComponent(remote));
+    const j = await r.json();
+    if (!j.ok) {
+      result.innerHTML = `<span style="color:#dc2626">Reconcile failed: ${escapeHtml(j.error)}</span>`;
+      return;
+    }
+    const orphans = j.orphans || [];
+    const missing = j.missing_local || [];
+    let html = `<div style="font-weight:600;color:#7c2d12;margin-bottom:6px">Reconcile: <code>${escapeHtml(remote)}</code></div>`;
+    html += `<div style="color:#92400e">✓ ${j.registered.length} item(s) match registry · ☁️ ${orphans.length} orphan(s) on cloud · 📭 ${missing.length} missing on cloud</div>`;
+
+    if (orphans.length > 0) {
+      html += `<div style="margin-top:10px"><b>Orphans on cloud (uploaded but not in registry):</b></div>`;
+      html += `<table style="width:100%;margin-top:6px;font-size:12px"><thead><tr><th style="text-align:left">Name</th><th class="num">Size</th><th></th></tr></thead><tbody>`;
+      for (const o of orphans) {
+        const sz = fmtBytes(o.size_bytes);
+        const safeName = escapeHtml(o.inferred_name);
+        const escRemotePath = escapeHtml(o.remote_path).replace(/'/g, "\\'");
+        const escIs = o.is_dir ? "true" : "false";
+        html += `<tr>
+          <td>${o.is_dir ? "📁" : "📄"} <b>${safeName}</b><div style="font-size:10px;color:var(--muted)">${escapeHtml(o.remote_path)}</div></td>
+          <td class="num">${sz}</td>
+          <td><button class="tiny" onclick="importOrphan('${escapeHtml(remote)}','${escRemotePath}','${escapeHtml(o.inferred_name).replace(/'/g, "\\'")}',${escIs},${o.size_bytes})">Import</button></td>
+        </tr>`;
+      }
+      html += `</tbody></table>`;
+      html += `<div style="margin-top:6px;font-size:11px;color:#92400e">After importing, the file shows up in Archived items and you can Restore/Delete it normally.</div>`;
+    }
+
+    if (missing.length > 0) {
+      html += `<div style="margin-top:10px"><b>Missing on cloud (registry says it's there, but cloud doesn't):</b></div>`;
+      html += `<ul style="margin:4px 0 0 22px;padding:0;font-size:12px">`;
+      for (const m of missing.slice(0, 10)) {
+        html += `<li>${escapeHtml(m.name || m.original_path || "")} — <code>${escapeHtml(m.remote_path)}</code></li>`;
+      }
+      html += `</ul>`;
+      html += `<div style="margin-top:6px;font-size:11px;color:#92400e">These may have been deleted from cloud out-of-band. Their registry entries are stale.</div>`;
+    }
+
+    if (orphans.length === 0 && missing.length === 0) {
+      html += `<div style="margin-top:8px;color:#16a34a">✓ Everything matches. No reconciliation needed.</div>`;
+    }
+    result.innerHTML = html;
+  } catch (e) {
+    result.innerHTML = `<span style="color:#dc2626">Reconcile failed: ${escapeHtml(e.message)}</span>`;
+  }
+}
+
+async function importOrphan(remote, remotePath, name, isDir, sizeBytes) {
+  try {
+    const r = await fetch("/cloud/import-orphan", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({remote, remote_path: remotePath, inferred_name: name,
+                            is_dir: !!isDir, size_bytes: sizeBytes}),
+    });
+    const j = await r.json();
+    if (j.ok) {
+      refreshCloud();
+      // Re-run reconcile so user sees it move from orphans → registered
+      setTimeout(() => reconcileWithCloud(), 500);
+    } else {
+      alert("Import failed: " + (j.error || "unknown"));
+    }
+  } catch (e) { alert("Import failed: " + e.message); }
+}
+
 async function pickFolder() {
   const el = document.getElementById("scanStatus");
   el.textContent = "Opening folder picker…"; el.className = "status";
@@ -3424,6 +3635,8 @@ async function scanFolder(opts) {
     const errPart = (j.errors && j.errors.length) ? ` (${j.errors.length} path failed)` : "";
     el.textContent = `Scanned ${j.items.length} item(s)${errPart}`;
     el.className = j.errors && j.errors.length ? "status err" : "status ok";
+    // Remember successful scans in recent history
+    if (!opts || !opts.isDrillDown) rememberScan(path);
   } catch (e) {
     el.textContent = "Failed: " + e.message;
     el.className = "status err";
@@ -4571,6 +4784,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 result = {"ok": ok, "target": tgt, "items": merged_items,
                           "totals_bytes": merged_totals, "errors": errors}
             self._send(200, json.dumps(result).encode(), "application/json")
+        elif self.path.startswith("/cloud/reconcile"):
+            from urllib.parse import urlparse, parse_qs
+            params = parse_qs(urlparse(self.path).query)
+            remote_name = (params.get("remote", [""])[0]).strip()
+            if not remote_name:
+                self._send(400, b'{"ok":false,"error":"remote required"}', "application/json")
+            else:
+                self._send(200, json.dumps(reconcile_remote(remote_name)).encode(), "application/json")
         elif self.path.startswith("/cloud/open-web"):
             # Open the remote's web UI in the user's default browser.
             from urllib.parse import urlparse, parse_qs
@@ -4878,6 +5099,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Browser disconnect / refresh won't kill the upload anymore.
             job = archive_start_job(path, remote)
             self._send(200, json.dumps({"ok": True, "job_id": job["id"], "job": job}).encode(), "application/json")
+
+        elif self.path == "/cloud/import-orphan":
+            try:
+                payload_in = json.loads(body)
+            except Exception:
+                self._send(400, b'{"ok":false,"error":"invalid json"}', "application/json"); return
+            result = import_orphan_archive(
+                remote=(payload_in.get("remote") or "").strip(),
+                remote_path=(payload_in.get("remote_path") or "").strip(),
+                inferred_name=(payload_in.get("inferred_name") or "").strip(),
+                is_dir=bool(payload_in.get("is_dir")),
+                size_bytes=int(payload_in.get("size_bytes") or 0),
+                original_path=(payload_in.get("original_path") or None),
+            )
+            self._send(200, json.dumps(result).encode(), "application/json")
 
         elif self.path == "/cloud/restore":
             try:
