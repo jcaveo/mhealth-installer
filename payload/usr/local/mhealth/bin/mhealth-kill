@@ -1885,6 +1885,7 @@ HTML = r"""<!DOCTYPE html>
           <button class="tiny" onclick="setScanPreset('~/Movies')">~/Movies</button>
           <span class="status" id="scanStatus" style="margin-left:auto"></span>
         </div>
+        <div id="scanBreadcrumbs" style="display:none;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:8px;font-size:13px;display:flex;align-items:center;gap:6px;flex-wrap:wrap"></div>
         <div id="scanLegend" style="font-size:12px;color:var(--muted);margin-bottom:8px;display:none">
           <span style="display:inline-block;margin-right:14px">🗑 <b>Delete</b> — regenerable</span>
           <span style="display:inline-block;margin-right:14px">☁️ <b>Archive</b> — cold assets</span>
@@ -2662,6 +2663,9 @@ document.addEventListener("mouseout", (e) => {
 // --- Cloud Archive -------------------------------------------------------
 let cloudState = { rclone_available: false, remotes: [], archives: [] };
 let scanResult = null;
+// Navigation history for drill-down. Each entry: {path, label}. The last entry
+// is the current location. Reset when user enters a fresh path or comma-separated paths.
+let navigationStack = [];
 
 // Helper: render a code block with a copy-to-clipboard button.
 function codeBlockWithCopy(code, label) {
@@ -2849,6 +2853,7 @@ async function refreshCloud() {
   try {
     const r = await fetch("/cloud");
     cloudState = await r.json();
+    if (cloudState.home) window.__HOME__ = cloudState.home;
     renderCloudHeader();
     renderArchives();
     archEl.textContent = "Updated " + new Date().toLocaleTimeString();
@@ -3097,7 +3102,9 @@ async function scanHomeOverview() {
   }
 }
 
-async function scanFolder() {
+async function scanFolder(opts) {
+  // opts.isDrillDown=true means "don't reset the navigation stack" (the caller
+  // already pushed/popped). Default = fresh scan from the input box.
   const path = document.getElementById("scanPath").value.trim();
   if (!path) { alert("Enter a path to scan, click 📂 Browse, or pick a preset."); return; }
   const el = document.getElementById("scanStatus");
@@ -3109,7 +3116,6 @@ async function scanFolder() {
     if (!j.ok && !j.items) {
       el.textContent = "Error";
       el.className = "status err";
-      // TCC = "Operation not permitted" almost always. Show the help card.
       if (/permission denied|not permitted|TCC|privacy/i.test(j.error || "")) {
         showTccHelp(path, j.error);
       } else {
@@ -3117,6 +3123,19 @@ async function scanFolder() {
       }
       return;
     }
+
+    // Manage navigation stack for fresh scans (not drill-downs).
+    // Multi-path scans disable drill-down entirely.
+    if (!opts || !opts.isDrillDown) {
+      const isMultiPath = path.includes(",");
+      if (isMultiPath) {
+        navigationStack = []; // breadcrumbs hidden for multi-path
+      } else {
+        const label = pathDisplayName(path);
+        navigationStack = [{ path: path, resolved: j.target, label }];
+      }
+    }
+
     scanResult = j;
     renderScanResult();
     const errPart = (j.errors && j.errors.length) ? ` (${j.errors.length} path failed)` : "";
@@ -3126,6 +3145,66 @@ async function scanFolder() {
     el.textContent = "Failed: " + e.message;
     el.className = "status err";
   }
+}
+
+function pathDisplayName(p) {
+  const home = window.__HOME__ || "";
+  if (home && p === home) return "~";
+  if (home && p.startsWith(home + "/")) return "~/" + p.slice(home.length + 1).split("/").pop();
+  return p.split("/").filter(Boolean).pop() || p;
+}
+
+function pathDisplayFull(p) {
+  const home = window.__HOME__ || "";
+  if (home && p.startsWith(home + "/")) return "~/" + p.slice(home.length + 1);
+  if (home && p === home) return "~";
+  return p;
+}
+
+// Click a folder row → push it onto the stack and scan into it.
+async function drillIntoFolder(path) {
+  const label = pathDisplayName(path);
+  navigationStack.push({ path, resolved: path, label });
+  document.getElementById("scanPath").value = pathDisplayFull(path);
+  await scanFolder({ isDrillDown: true });
+}
+
+// Click a breadcrumb segment → truncate stack to that index and scan.
+async function navigateToBreadcrumb(index) {
+  if (index < 0 || index >= navigationStack.length) return;
+  navigationStack = navigationStack.slice(0, index + 1);
+  const target = navigationStack[index];
+  document.getElementById("scanPath").value = pathDisplayFull(target.resolved || target.path);
+  await scanFolder({ isDrillDown: true });
+}
+
+// "Up" button — pop one off the stack.
+async function navigateUp() {
+  if (navigationStack.length <= 1) return;
+  navigationStack.pop();
+  const target = navigationStack[navigationStack.length - 1];
+  document.getElementById("scanPath").value = pathDisplayFull(target.resolved || target.path);
+  await scanFolder({ isDrillDown: true });
+}
+
+function renderBreadcrumbs() {
+  const el = document.getElementById("scanBreadcrumbs");
+  if (!el) return;
+  if (navigationStack.length <= 0) { el.style.display = "none"; return; }
+  const segments = navigationStack.map((seg, i) => {
+    const isLast = i === navigationStack.length - 1;
+    const safe = escapeHtml(seg.label);
+    if (isLast) {
+      return `<span style="color:#111827;font-weight:600">${safe}</span>`;
+    }
+    return `<a onclick="navigateToBreadcrumb(${i})" style="color:#2563eb;cursor:pointer;text-decoration:underline">${safe}</a>`;
+  }).join('<span style="color:var(--muted)">/</span>');
+  const upBtn = navigationStack.length > 1
+    ? `<button onclick="navigateUp()" class="tiny" style="margin-right:8px" title="Go up one level">↑</button>`
+    : "";
+  el.innerHTML = `<span style="color:var(--muted)">📍</span> ${upBtn}${segments}
+    <span style="margin-left:auto;color:var(--muted);font-size:11px">${escapeHtml(pathDisplayFull((navigationStack[navigationStack.length-1].resolved || navigationStack[navigationStack.length-1].path)))}</span>`;
+  el.style.display = "flex";
 }
 
 function hideTccHelp() {
@@ -3207,6 +3286,7 @@ function renderScanResult() {
   document.getElementById("scanLegend").style.display = "block";
   document.getElementById("scanActions").style.display = "block";
   document.getElementById("scanTable").style.display = "table";
+  renderBreadcrumbs();
 
   const t = scanResult.totals_bytes || {};
   document.getElementById("scanTotals").style.display = "block";
@@ -3219,15 +3299,25 @@ function renderScanResult() {
 
   const icon = (c) => ({delete:"🗑", archive:"☁️", check:"⚠️", keep:"🔒"}[c] || "");
   const sorted = [...scanResult.items].sort((a, b) => b.size_bytes - a.size_bytes);
-  document.getElementById("scanRows").innerHTML = sorted.map(it => `
-    <tr data-category="${escapeHtml(it.category)}">
+  document.getElementById("scanRows").innerHTML = sorted.map(it => {
+    // Folder names are clickable → drill into them. Files are plain.
+    const nameCell = it.is_dir
+      ? `<a onclick="drillIntoFolder('${escapeHtml(it.path)}')" style="color:#2563eb;cursor:pointer;font-weight:600" title="Click to drill into this folder">${escapeHtml(it.name)}</a><span style="color:var(--muted);font-size:11px"> /</span>`
+      : `<b>${escapeHtml(it.name)}</b>`;
+    const revealBtn = `<button class="tiny" onclick="revealPathInFinder('${escapeHtml(it.path)}')" title="Reveal in Finder" style="padding:2px 6px;font-size:10px;margin-left:6px">↗</button>`;
+    return `<tr data-category="${escapeHtml(it.category)}">
       <td><input type="checkbox" class="scan-cb" data-path="${escapeHtml(it.path)}" data-category="${escapeHtml(it.category)}"></td>
       <td style="font-size:16px;text-align:center">${icon(it.category)}</td>
-      <td><b>${escapeHtml(it.name)}</b>${it.is_dir ? '<span style="color:var(--muted);font-size:11px"> /</span>' : ''}</td>
+      <td>${nameCell}${revealBtn}</td>
       <td class="num">${fmtBytes(it.size_bytes)}</td>
       <td><span class="badge">${escapeHtml(it.category)}</span></td>
       <td><span class="desc">${escapeHtml(it.reason)}</span></td>
-    </tr>`).join("");
+    </tr>`;
+  }).join("");
+}
+
+async function revealPathInFinder(path) {
+  await fetch("/reveal?path=" + encodeURIComponent(path)).catch(() => {});
 }
 
 function toggleAllScan() {
@@ -3878,6 +3968,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "rclone_path": _which_rclone(),
                 "remotes": remotes,
                 "archives": _archives_load(),
+                "home": os.path.expanduser("~"),
             }).encode()
             self._send(200, payload, "application/json")
         elif self.path.startswith("/cloud/scan"):

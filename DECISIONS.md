@@ -4,6 +4,28 @@ Append-only per CLAUDE.md. New entries on top.
 
 ---
 
+## 2026-05-17 — Folder drill-down with breadcrumbs (Archive tab)
+
+**Status:** completed
+**Changes:**
+- New `navigationStack` JS state — array of `{path, resolved, label}` entries; last entry = current location
+- Folder rows in scan results are now clickable (blue underline) → `drillIntoFolder(path)` pushes onto stack and re-scans
+- Breadcrumb bar above the scan table: `📍 [↑] ~ / Documents / projects / aveo-finance-hub`. Each non-last segment is a clickable link → `navigateToBreadcrumb(i)` truncates stack to that level
+- `↑` button (up arrow) pops one level when stack > 1
+- Right side of breadcrumb shows the full home-relative path as muted text for context
+- New `pathDisplayName` / `pathDisplayFull` helpers normalize `/Users/jc/…` → `~/…`
+- `/cloud` endpoint now includes `home` field → page stashes it in `window.__HOME__` so path-prettification works everywhere
+- Each row has a tiny `↗` button next to the name → reveals that exact path in Finder (separate from drill-down)
+- Fresh scans (from the input box) RESET the stack; drill-downs append. Multi-path scans (comma-separated) hide breadcrumbs entirely.
+
+**Why:**
+- User wanted to expand folders inline and "see content inside" without leaving the web UI
+- Drilling into project folders from a parent like `~/Documents/projects` reveals per-subfolder size + classification
+
+**UX note:** Breadcrumb segments use the basename for compact display, but the full path always shows on the right of the bar — no ambiguity about where you are.
+
+---
+
 ## 2026-05-17 — Cloud Setup: always-visible providers grid + TCC help card
 
 **Status:** completed
