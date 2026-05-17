@@ -1332,13 +1332,28 @@ def import_orphan_archive(remote: str, remote_path: str, inferred_name: str,
 
 def bind_local_path(entry_id: str, local_path: str) -> dict:
     """Update an archive entry's original_path. Useful for orphan-imported
-    entries that lost their local path (so verify/re-archive/delete-local can work)."""
+    entries that lost their local path (so verify/re-archive/delete-local can work).
+
+    Safety guards:
+    - Refuses to bind to $HOME root (way too broad — risks suggesting deletion of
+      225 GB when archive is 263 MB).
+    - Refuses to bind to a path that doesn't exist (user typo).
+    """
     local_path = os.path.expanduser((local_path or "").strip())
     if not local_path:
         return {"ok": False, "error": "local_path required"}
     home = os.path.expanduser("~")
     if not (local_path == home or local_path.startswith(home + os.sep)):
         return {"ok": False, "error": "local_path must be under $HOME"}
+    # Reject $HOME root and 1st-level common dirs (~/Desktop, ~/Documents, etc.)
+    # since those are way too broad to be the original archive source.
+    too_broad = {home}
+    for d in ("Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures", "Library"):
+        too_broad.add(os.path.join(home, d))
+    if local_path in too_broad:
+        return {"ok": False, "error": f"'{local_path}' is too broad — bind to the specific subfolder the archive came from (e.g. ~/Desktop/Work/Upwork sessions and calls-gigradar)"}
+    if not os.path.exists(local_path):
+        return {"ok": False, "error": f"path does not exist on disk: {local_path}"}
     with _ARCHIVES_LOCK:
         items = _archives_load()
         for e in items:
@@ -4482,24 +4497,28 @@ async function verifyArchive(id) {
     } else if (j.status === "local_missing") {
       // For orphan-imported entries, original_path is "(unknown)" — offer to bind
       if ((j.local_path || "").includes("(unknown")) {
+        // No default value — user MUST type the specific subfolder. (Previous
+        // default of "~/" caused users to accidentally bind to home root.)
         const newPath = prompt(
-          `This archive was imported from cloud without a local path.\n\nCloud has ${fmtBytes(j.remote_size)}.\n\nIf the original local folder/file still exists, paste its path to bind it (e.g. ~/Desktop/Work/Upwork sessions and calls-gigradar) so Verify and Re-archive work:`,
-          "~/"
+          `This archive was imported from cloud without a local path.\n\n` +
+          `Cloud has ${fmtBytes(j.remote_size)}.\n\n` +
+          `Paste the EXACT path of the original local folder/file (e.g.\n` +
+          `  ~/Desktop/Work/Upwork sessions and calls-gigradar\n` +
+          `not just ~/Desktop).\n\n` +
+          `Leave blank to cancel.`,
+          ""
         );
-        if (newPath) {
-          const r = await fetch("/cloud/bind-local", {
-            method: "POST", headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({id, local_path: newPath}),
-          });
-          const j2 = await r.json();
-          if (j2.ok) {
-            refreshCloud();
-            setTimeout(() => verifyArchive(id), 500); // re-verify with bound path
-            return;
-          } else {
-            alert("Bind failed: " + (j2.error || "unknown"));
-            return;
-          }
+        if (!newPath || !newPath.trim()) return;
+        const r = await fetch("/cloud/bind-local", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({id, local_path: newPath.trim()}),
+        });
+        const j2 = await r.json();
+        if (j2.ok) {
+          refreshCloud();
+          setTimeout(() => verifyArchive(id), 500); // re-verify with bound path
+        } else {
+          alert("Bind failed: " + (j2.error || "unknown"));
         }
         return;
       }
