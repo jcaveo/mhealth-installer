@@ -2388,7 +2388,7 @@ HTML = r"""<!DOCTYPE html>
         </div>
         <div id="reconcileResult" style="display:none;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:12px"></div>
         <table id="archTable">
-          <colgroup><col style="width:200px"><col><col style="width:80px"><col style="width:100px"><col style="width:360px"></colgroup>
+          <colgroup><col style="width:200px"><col><col style="width:80px"><col style="width:100px"><col style="width:110px"></colgroup>
           <thead><tr><th>Filename</th><th>Original path</th><th>Remote</th><th class="num">Size</th><th></th></tr></thead>
           <tbody id="archRows"><tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">No archives yet.</td></tr></tbody>
         </table>
@@ -3370,6 +3370,28 @@ function fmtBytes(n) {
   return (n/1073741824).toFixed(2) + " GB";
 }
 
+// Delegated click handler — the archived items rows are re-rendered on every
+// refresh, so we wire ONE handler on the tbody (not per-button) to handle the
+// "Actions ▾" menu trigger.
+document.addEventListener("DOMContentLoaded", () => {
+  const tbody = document.getElementById("archRows");
+  if (tbody) {
+    tbody.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-archive-actions]");
+      if (!btn) return;
+      e.stopPropagation();
+      showArchiveActions(
+        btn.dataset.id,
+        btn.dataset.name,
+        btn.dataset.path,
+        btn.dataset.remote,
+        btn.dataset.remotePath,
+        btn,
+      );
+    });
+  }
+});
+
 async function refreshCloud() {
   const archEl = document.getElementById("archStatus");
   archEl.textContent = "Loading…"; archEl.className = "status";
@@ -3570,15 +3592,13 @@ function renderArchives() {
           <td style="vertical-align:top"><span class="badge">${escapeHtml(a.remote)}</span></td>
           <td class="num" style="vertical-align:top;white-space:nowrap">${fmtBytes(a.size_bytes)}</td>
           <td style="vertical-align:top">
-            <div style="display:flex;flex-wrap:wrap;gap:4px">
-              <button class="tiny" onclick="verifyArchive('${escapeHtml(a.id)}')" title="Compare local size vs cloud size — detects partial uploads">✓ Verify</button>
-              <button class="tiny" onclick="restoreArchive('${escapeHtml(a.id)}')" title="Download back to original path">↓ Restore</button>
-              <button class="tiny" onclick="revealLocalIfExists('${escapeHtml(a.original_path)}')" title="Open original local folder in Finder (if still present)">📂 Open local</button>
-              <button class="tiny" onclick="openInCloud('${escapeHtml(a.remote)}', '${escapeHtml(remotePathDisplay)}')" title="Open ${escapeHtml(a.remote)} web UI">🔗 Open cloud</button>
-              <button class="tiny" onclick="rearchive('${escapeHtml(a.id)}','${escapeHtml(fileName)}')" title="Delete remote copy + re-upload fresh from local (fixes partial uploads)">🔄 Re-archive</button>
-              <button class="tiny danger" onclick="deleteLocalSafe('${escapeHtml(a.id)}','${escapeHtml(fileName)}')" title="Verify upload then delete local copy">🗑 Delete local</button>
-              <button class="tiny danger" onclick="deleteArchiveItem('${escapeHtml(a.id)}','${escapeHtml(fileName)}')" title="Remove remote copy + registry entry">Delete from cloud</button>
-            </div>
+            <button class="tiny" data-archive-actions
+                    data-id="${escapeHtml(a.id)}"
+                    data-name="${escapeHtml(fileName)}"
+                    data-path="${escapeHtml(a.original_path || '')}"
+                    data-remote="${escapeHtml(a.remote)}"
+                    data-remote-path="${escapeHtml(remotePathDisplay)}"
+                    style="font-weight:600">Actions ▾</button>
           </td>
         </tr>`;
       }).join("");
@@ -4320,6 +4340,89 @@ async function deleteArchiveItem(id, name) {
   if (!confirm(`Delete cloud copy of "${name}"?\nThis removes the remote files AND the archive record.\nLocal files (if any) are untouched.`)) return;
   await fetch("/cloud?id=" + encodeURIComponent(id), { method: "DELETE" });
   refreshCloud();
+}
+
+// ---- Generic action-menu popover ----
+// items: [{icon, label, desc, action, danger?}]
+// anchor: the DOM element to position relative to
+function showActionsMenu(items, anchor) {
+  // Close any existing menu
+  document.querySelectorAll(".actions-menu").forEach(m => m.remove());
+  const menu = document.createElement("div");
+  menu.className = "actions-menu";
+  menu.style.cssText = "position:absolute;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,0.18);min-width:340px;max-width:400px;z-index:9999;overflow:hidden";
+  items.forEach((it, i) => {
+    const row = document.createElement("div");
+    const danger = it.danger ? "background:#fef2f2;" : "";
+    const titleColor = it.danger ? "#991b1b" : "#111827";
+    row.style.cssText = `padding:10px 14px;cursor:pointer;border-top:${i?'1px solid var(--line)':'none'};${danger}`;
+    row.innerHTML = `
+      <div style="font-weight:600;font-size:13px;color:${titleColor}">${it.icon || ""} ${escapeHtml(it.label)}</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:2px;line-height:1.4">${escapeHtml(it.desc || "")}</div>`;
+    row.addEventListener("mouseover", () => { row.style.filter = "brightness(0.96)"; });
+    row.addEventListener("mouseout", () => { row.style.filter = ""; });
+    row.addEventListener("click", () => {
+      menu.remove();
+      try { it.action(); } catch (e) { alert("Action failed: " + e.message); }
+    });
+    menu.appendChild(row);
+  });
+  document.body.appendChild(menu);
+  // Position below the anchor; flip up if not enough room
+  const rect = anchor.getBoundingClientRect();
+  const menuRect = menu.getBoundingClientRect();
+  let top = rect.bottom + window.scrollY + 4;
+  if (rect.bottom + menuRect.height + 20 > window.innerHeight) {
+    top = rect.top + window.scrollY - menuRect.height - 4;
+  }
+  let left = rect.left + window.scrollX;
+  if (left + menuRect.width + 10 > window.innerWidth + window.scrollX) {
+    left = window.innerWidth + window.scrollX - menuRect.width - 10;
+  }
+  menu.style.top = top + "px";
+  menu.style.left = left + "px";
+  // Close on outside click
+  setTimeout(() => {
+    document.addEventListener("click", function close(e) {
+      if (!menu.contains(e.target) && e.target !== anchor) {
+        menu.remove();
+        document.removeEventListener("click", close);
+      }
+    });
+  }, 50);
+  // Close on ESC
+  document.addEventListener("keydown", function esc(e) {
+    if (e.key === "Escape") {
+      menu.remove();
+      document.removeEventListener("keydown", esc);
+    }
+  });
+}
+
+function showArchiveActions(id, name, originalPath, remote, remotePath, btnEl) {
+  showActionsMenu([
+    {icon: "✓", label: "Verify",
+     desc: "Compare local size vs cloud size. Detects partial / incomplete uploads where the cloud copy is smaller than your local folder.",
+     action: () => verifyArchive(id)},
+    {icon: "↓", label: "Restore",
+     desc: "Download the cloud copy back to its original local path. Refuses if the local path already exists (to avoid overwriting).",
+     action: () => restoreArchive(id)},
+    {icon: "📂", label: "Open local in Finder",
+     desc: "Reveal the original local file or folder in Finder (if it's still on disk).",
+     action: () => revealLocalIfExists(originalPath)},
+    {icon: "🔗", label: "Open in cloud",
+     desc: "Open the cloud provider's web UI in your browser (Mega/Drive/Dropbox/etc). A toast shows the exact remote path to navigate to.",
+     action: () => openInCloud(remote, remotePath)},
+    {icon: "🔄", label: "Re-archive (fresh upload)",
+     desc: "Delete the current cloud copy (may be partial/incomplete) and queue a fresh upload from local. Background job — survives browser refresh. Local copy untouched.",
+     action: () => rearchive(id, name)},
+    {icon: "🗑", label: "Delete local (after verify)", danger: true,
+     desc: "Verifies the cloud copy is complete first — REFUSES if cloud is partial. Then removes the local copy. The cloud copy stays as your backup.",
+     action: () => deleteLocalSafe(id, name)},
+    {icon: "❌", label: "Delete from cloud", danger: true,
+     desc: "Remove the remote copy + registry entry. Your local file (if any) is untouched.",
+     action: () => deleteArchiveItem(id, name)},
+  ], btnEl);
 }
 
 async function revealLocalIfExists(path) {
