@@ -969,6 +969,24 @@ def rclone_about(remote: str) -> dict:
         return {}
 
 
+def rclone_size_bytes(target: str, timeout: int = 60) -> int:
+    """Sum bytes at <remote>:<path> via `rclone size --json`. Returns -1 on failure."""
+    exe = _which_rclone()
+    if not exe:
+        return -1
+    try:
+        r = subprocess.run(
+            [exe, "size", target, "--json"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return -1
+        data = json.loads(r.stdout)
+        return int(data.get("bytes", -1))
+    except Exception:
+        return -1
+
+
 def rclone_run(args: list[str], timeout: int = 3600) -> tuple[int, str, str]:
     exe = _which_rclone()
     if not exe:
@@ -1287,11 +1305,16 @@ def import_orphan_archive(remote: str, remote_path: str, inferred_name: str,
                           is_dir: bool, size_bytes: int,
                           original_path: str | None = None) -> dict:
     """Import an orphan remote file into the local registry so it shows up in the
-    Archived items UI (and can be Restored / Deleted). The original_path is best-
-    effort — we don't know where it came from unless caller provides it; otherwise
-    we mark it as 'unknown'."""
+    Archived items UI. If size_bytes is missing/negative, query the remote for
+    real bytes via `rclone size`."""
     entry_id = remote_path.split("/")[-1].split("-")[0] + "-" + remote_path.split("/")[-1].split("-")[1] \
         if re.match(r"^.+/\d+-\d+-", remote_path) else f"imported-{int(time.time()*1000)}"
+    # Compute real size if not provided or unknown — `rclone lsjson` returns -1
+    # for Mega dirs since sizes aren't pre-cached.
+    if size_bytes is None or size_bytes < 0:
+        size_bytes = rclone_size_bytes(f"{remote}:{remote_path}")
+        if size_bytes < 0:
+            size_bytes = 0  # fallback so UI doesn't show -1 B
     entry = {
         "id": entry_id,
         "original_path": original_path or f"~/(unknown — imported from {remote})",
@@ -1305,6 +1328,23 @@ def import_orphan_archive(remote: str, remote_path: str, inferred_name: str,
     }
     archives_add(entry)
     return {"ok": True, "entry": entry}
+
+
+def archives_backfill_sizes() -> dict:
+    """One-shot: for any archive with size_bytes <= 0, query rclone size and update."""
+    with _ARCHIVES_LOCK:
+        items = _archives_load()
+        updated = 0
+        for a in items:
+            if (a.get("size_bytes") or 0) > 0:
+                continue
+            sz = rclone_size_bytes(f"{a.get('remote')}:{a.get('remote_path')}")
+            if sz > 0:
+                a["size_bytes"] = sz
+                updated += 1
+        if updated:
+            _archives_save(items)
+    return {"ok": True, "updated": updated}
 
 
 def delete_archive(entry_id: str) -> dict:
@@ -3201,7 +3241,7 @@ n/s/q> q`))}
 }
 
 function fmtBytes(n) {
-  if (n == null) return "—";
+  if (n == null || n < 0) return "—";  // rclone reports -1 for unknown (e.g., Mega dir sizes)
   if (n < 1024) return n + " B";
   if (n < 1048576) return (n/1024).toFixed(1) + " KB";
   if (n < 1073741824) return (n/1048576).toFixed(1) + " MB";
@@ -5099,6 +5139,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Browser disconnect / refresh won't kill the upload anymore.
             job = archive_start_job(path, remote)
             self._send(200, json.dumps({"ok": True, "job_id": job["id"], "job": job}).encode(), "application/json")
+
+        elif self.path == "/cloud/backfill-sizes":
+            result = archives_backfill_sizes()
+            self._send(200, json.dumps(result).encode(), "application/json")
 
         elif self.path == "/cloud/import-orphan":
             try:
