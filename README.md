@@ -14,8 +14,8 @@ Mac monitoring + activity + cloud archive dashboard, packaged as a one-click `.p
 | **Caches** | System cache cleanup (npm/Docker/Homebrew/Chrome/etc.) with risk levels |
 | **Archive** | Folder scanner + cloud upload/restore via rclone (BYO Drive/Mega/R2/etc.) |
 | **Projects** | Tracker for projects built with Claude |
-| **Time Spent** | App + browser + shell activity analysis |
 | **Cloud Setup** | Configure rclone remotes (one-time per dev) |
+| ~~Time Spent~~ | **Hidden by default** for privacy. See [TODO_HIDDEN_FEATURES.md](TODO_HIDDEN_FEATURES.md) — opt-in via `MHEALTH_ENABLE_TIME_SPENT=1 mhealth-setup` |
 
 Plus a snooze widget in the top-right to silence health-watcher notifications for 15min / 1hr / 2hr / until tomorrow.
 

@@ -22,7 +22,19 @@ mkdir -p "$LAUNCH_DIR"
 mkdir -p "$HOME/Library/Logs"
 mkdir -p "$HOME/Library/Application Support/mac-health-watcher"
 
-for job in watcher activity server; do
+# Time Spent feature is OFF by default (privacy). Set MHEALTH_ENABLE_TIME_SPENT=1
+# in your environment when running mhealth-setup to include the activity logger
+# AND surface the Time Spent tab in the dashboard.
+JOBS="watcher server"
+if [ "${MHEALTH_ENABLE_TIME_SPENT:-0}" = "1" ]; then
+  JOBS="watcher activity server"
+  echo "→ MHEALTH_ENABLE_TIME_SPENT=1 — activity logger will be installed"
+else
+  echo "→ Time Spent feature disabled (default). Activity logger NOT installed."
+  echo "  To enable later, run:  MHEALTH_ENABLE_TIME_SPENT=1 mhealth-setup"
+fi
+
+for job in $JOBS; do
   src="$TEMPLATE_DIR/com.mhealth.${job}.plist"
   dst="$LAUNCH_DIR/com.mhealth.${job}.plist"
 
@@ -43,6 +55,26 @@ for job in watcher activity server; do
     launchctl load "$dst" 2>/dev/null || true
   fi
 done
+
+# If activity is opted-in, also pass MHEALTH_ENABLE_TIME_SPENT to the server
+# so the dashboard reveals the Time Spent tab.
+if [ "${MHEALTH_ENABLE_TIME_SPENT:-0}" = "1" ]; then
+  SERVER_PLIST="$LAUNCH_DIR/com.mhealth.server.plist"
+  if [ -f "$SERVER_PLIST" ] && ! grep -q "MHEALTH_ENABLE_TIME_SPENT" "$SERVER_PLIST"; then
+    # Insert EnvironmentVariables block before </dict>
+    python3 - "$SERVER_PLIST" <<'PY'
+import sys, plistlib
+p = sys.argv[1]
+with open(p, "rb") as f:
+    plist = plistlib.load(f)
+plist.setdefault("EnvironmentVariables", {})["MHEALTH_ENABLE_TIME_SPENT"] = "1"
+with open(p, "wb") as f:
+    plistlib.dump(plist, f)
+PY
+    launchctl bootout "gui/${UID_NUM}" "$SERVER_PLIST" 2>/dev/null || true
+    launchctl bootstrap "gui/${UID_NUM}" "$SERVER_PLIST" 2>/dev/null || true
+  fi
+fi
 
 # Best-effort: detect terminal-notifier and warn if missing
 TN_FOUND=""

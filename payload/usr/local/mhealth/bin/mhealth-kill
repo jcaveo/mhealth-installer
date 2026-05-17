@@ -1177,6 +1177,35 @@ def _aggregate_app_time(rows: list[dict]) -> tuple[list[dict], int, int]:
     return out, active_total, total
 
 
+def _browser_time_by_host(activity_rows: list[dict]) -> dict[str, int]:
+    """Count activity-log rows per browser host within the active window.
+    Each row represents ~1 minute frontmost on that URL — only count when the user
+    was NOT idle (idle_sec < threshold). Returns {host: minutes}."""
+    from collections import Counter
+    from urllib.parse import urlparse
+    counter: Counter = Counter()
+    for r in activity_rows:
+        try:
+            idle = int(r.get("idle_sec") or 0)
+        except (TypeError, ValueError):
+            idle = 0
+        if idle >= IDLE_THRESHOLD_SEC:
+            continue
+        url = (r.get("browser_url") or "").strip()
+        if not url:
+            continue
+        try:
+            host = (urlparse(url).hostname or "").lower()
+        except Exception:
+            continue
+        if not host or host in ("127.0.0.1", "localhost"):
+            continue
+        if host.startswith("www."):
+            host = host[4:]
+        counter[host] += 1   # 1 row = 1 minute (activity logger runs every 60 s)
+    return dict(counter)
+
+
 def _browser_history_top_sites(since_unix: int, top: int = 20) -> list[dict]:
     """Aggregate visits across ALL Chrome + Brave profiles."""
     from collections import Counter
@@ -1288,6 +1317,10 @@ def time_spent_summary(range_key: str) -> dict:
     rows = _parse_activity_rows(since, now)
     apps, active_min, total_min = _aggregate_app_time(rows)
     sites = _browser_history_top_sites(int(since.timestamp()))
+    # Merge in time-spent per host from activity log (one row ≈ 1 minute frontmost)
+    time_by_host = _browser_time_by_host(rows)
+    for s in sites:
+        s["minutes"] = time_by_host.get(s["host"], 0)
     cmds = _shell_history_top(int(since.timestamp()))
     activity_log_exists = os.path.exists(ACTIVITY_LOG)
     return {
@@ -1692,7 +1725,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="tab" data-pane="caches" onclick="switchTab('caches')">Caches</div>
     <div class="tab" data-pane="archive" onclick="switchTab('archive')">Archive</div>
     <div class="tab" data-pane="projects" onclick="switchTab('projects')">Projects</div>
-    <div class="tab" data-pane="time" onclick="switchTab('time')">Time Spent</div>
+    <div class="tab" data-pane="time" onclick="switchTab('time')" id="timeSpentTab" style="display:none">Time Spent</div>
     <div class="tab" data-pane="cloudsetup" onclick="switchTab('cloudsetup')">Cloud Setup</div>
   </div>
 
@@ -2050,6 +2083,10 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Time Spent pane. The tab is hidden by default (see #timeSpentTab below).
+       To enable, set MHEALTH_ENABLE_TIME_SPENT=1 in the launchd plist's
+       EnvironmentVariables. Activity logger is also disabled by default in
+       distributed installs, so this pane shows no data even if reached directly. -->
   <div id="pane-time" class="pane">
     <div class="toolbar">
       <label>Range
@@ -2066,23 +2103,29 @@ HTML = r"""<!DOCTYPE html>
     <div id="timeBanner" class="banner" style="display:none">
       <span></span>
     </div>
-    <div class="layout" style="grid-template-columns: minmax(0,1.2fr) minmax(0,1fr); align-items:start">
+    <div class="layout" style="grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 18px; align-items:start">
+      <!-- Top-left: App time -->
       <section>
         <h2>App time <span style="color:var(--muted);font-weight:400;font-size:12px" id="timeTotals"></span></h2>
         <div id="appTimeRows" style="background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px"></div>
       </section>
+      <!-- Top-right: Top sites visited (with time spent column) -->
       <section>
-        <h2>Top sites visited (browser history)</h2>
+        <h2>Top sites visited <span style="color:var(--muted);font-weight:400;font-size:12px">(browser history + active minutes)</span></h2>
         <table>
-          <thead><tr><th>Host</th><th>Browser</th><th class="num">Visits</th></tr></thead>
+          <thead><tr><th>Host</th><th>Browser</th><th class="num">Time</th><th class="num">Visits</th></tr></thead>
           <tbody id="siteRows"></tbody>
         </table>
-        <h2 style="margin-top: 18px">Top shell commands</h2>
+      </section>
+      <!-- Bottom-left: Top shell commands -->
+      <section>
+        <h2>Top shell commands <span style="color:var(--muted);font-weight:400;font-size:12px">(zsh history in range)</span></h2>
         <table>
           <thead><tr><th>Command</th><th class="num">Count</th></tr></thead>
           <tbody id="cmdRows"></tbody>
         </table>
       </section>
+      <!-- Bottom-right: empty (CSS grid auto-flow) -->
     </div>
   </div>
 
@@ -2647,6 +2690,14 @@ async function refreshSnooze() {
 // Refresh on load + every 30 s (so the countdown updates without manual refresh)
 refreshSnooze();
 setInterval(refreshSnooze, 30 * 1000);
+
+// Time Spent tab is hidden by default for privacy. Server injects
+// window.__ENABLE_TIME_SPENT__ based on the MHEALTH_ENABLE_TIME_SPENT env var.
+// When true, reveal the tab.
+if (window.__ENABLE_TIME_SPENT__) {
+  const t = document.getElementById("timeSpentTab");
+  if (t) t.style.display = "";
+}
 
 // Hover effect for menu items
 document.addEventListener("mouseover", (e) => {
@@ -3605,11 +3656,18 @@ function renderActivity(j) {
     appsHtml || `<div style="color:var(--muted);padding:12px;text-align:center">No app-time data yet for this range.</div>`;
 
   document.getElementById("siteRows").innerHTML =
-    (j.top_sites || []).map(s => `<tr>
-      <td>${escapeHtml(s.host)}</td>
-      <td><span class="browser-tag ${s.browser}"><span class="browser-dot ${s.browser}"></span>${s.browser}</span></td>
-      <td class="num">${s.visits}</td>
-    </tr>`).join("") || `<tr><td colspan="3" style="color:var(--muted);text-align:center">No browser history in range.</td></tr>`;
+    (j.top_sites || []).map(s => {
+      const mins = s.minutes || 0;
+      const timeCell = mins > 0
+        ? `<span style="font-variant-numeric:tabular-nums">${fmtMin(mins)}</span>`
+        : '<span style="color:var(--muted)">—</span>';
+      return `<tr>
+        <td>${escapeHtml(s.host)}</td>
+        <td><span class="browser-tag ${s.browser}"><span class="browser-dot ${s.browser}"></span>${s.browser}</span></td>
+        <td class="num">${timeCell}</td>
+        <td class="num">${s.visits}</td>
+      </tr>`;
+    }).join("") || `<tr><td colspan="4" style="color:var(--muted);text-align:center">No browser history in range.</td></tr>`;
 
   document.getElementById("cmdRows").innerHTML =
     (j.top_commands || []).map(c => `<tr>
@@ -3928,7 +3986,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         global LAST_PING
         LAST_PING = time.time()
         if self.path == "/":
-            self._send(200, HTML.encode())
+            # Inject a feature-flag script tag before </head>. Time Spent is OFF
+            # by default for privacy in distributed installs; enable via:
+            #   MHEALTH_ENABLE_TIME_SPENT=1
+            # in the launchd plist's EnvironmentVariables.
+            enable_time = os.environ.get("MHEALTH_ENABLE_TIME_SPENT") == "1"
+            flag_script = f"<script>window.__ENABLE_TIME_SPENT__={'true' if enable_time else 'false'};</script>"
+            html_out = HTML.replace("</head>", flag_script + "</head>", 1)
+            self._send(200, html_out.encode())
         elif self.path == "/data":
             payload = json.dumps({
                 "procs": cached_processes(force=True),

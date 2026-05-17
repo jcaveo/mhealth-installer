@@ -4,6 +4,39 @@ Append-only per CLAUDE.md. New entries on top.
 
 ---
 
+## 2026-05-17 — Time Spent disabled by default + per-site minutes + layout reflow
+
+**Status:** completed
+**Changes:**
+
+**1. Privacy default: Time Spent OFF in distributed pkg.**
+- Even though data is 100% local (server binds to 127.0.0.1; no telemetry/egress), the optics of a boss-distributed tool tracking app/browser/shell usage are bad.
+- New env-var gate: `MHEALTH_ENABLE_TIME_SPENT=1`. Default = unset = feature OFF.
+- `mhealth-setup` skips `com.mhealth.activity.plist` unless flag set → **activity logger never loaded for teammates → data never collected**.
+- Server reads env var at request time and injects `<script>window.__ENABLE_TIME_SPENT__=true|false;</script>` into the served HTML.
+- Time Spent tab has `style="display:none"`; small JS reveals it only when flag is true.
+- JC's local plist gets `EnvironmentVariables → MHEALTH_ENABLE_TIME_SPENT=1` so JC keeps the feature for personal use.
+- New `TODO_HIDDEN_FEATURES.md` documents the deferral + how to re-enable + criteria for flipping default in the future.
+- README updated: Time Spent struck through with link to the TODO doc.
+
+**2. Per-site time spent (only visible when feature enabled).**
+- New `_browser_time_by_host(activity_rows)` counts activity-log rows per browser host (1 row ≈ 1 minute frontmost when not idle). Idle threshold = 60 s.
+- `time_spent_summary()` merges minutes into each `top_sites` entry alongside the existing browser-history visit count.
+- UI adds a `Time` column (Host · Browser · Time · Visits). Shows `1h 23m` formatted or `—` if no activity-log data for that host.
+
+**3. Time Spent pane layout reflow.**
+- Was: 2-column grid `[App time | Sites + Shell stacked]`.
+- Now: 2x2 grid `[App time | Sites] / [Shell | (empty)]`. Shell commands moved to bottom-left as requested.
+
+**Why:**
+- User flagged that shipping Time Spent to devs feels surveillance-y even with local-only data
+- User asked Top Sites to show time spent per site, not just visit count
+- User asked shell commands to move from bottom-right to bottom-left
+
+**Verified:** JC's plist now has the env var; served HTML reports `window.__ENABLE_TIME_SPENT__=true` for JC. Distributed pkg ships with the var unset → tab hidden + activity logger not installed.
+
+---
+
 ## 2026-05-17 — Folder drill-down with breadcrumbs (Archive tab)
 
 **Status:** completed
