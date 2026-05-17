@@ -3273,30 +3273,59 @@ async function showTccHelp(path, rawError) {
     const anchor = document.getElementById("scanTable");
     anchor.parentNode.insertBefore(el, anchor);
   }
-  // Get the actual python path from the server
+  // Get the actual python path(s) from the server
   let pythonPath = "/usr/bin/python3";
+  let pythonRealPath = pythonPath;
   try {
     const r = await fetch("/system/open-privacy-settings");
     const j = await r.json();
     if (j.python_path) pythonPath = j.python_path;
+    if (j.python_real_path) pythonRealPath = j.python_real_path;
   } catch {}
   el.innerHTML = `
     <h3 style="margin:0 0 10px;font-size:15px;color:#7c2d12">🔒 macOS is blocking access to <code>${escapeHtml(path)}</code></h3>
-    <p style="margin:0 0 12px;font-size:13px">macOS protects <b>Documents</b>, <b>Desktop</b>, and <b>Downloads</b> behind a privacy permission. You need to grant <b>Full Disk Access</b> to the Python interpreter that runs mhealth.</p>
-    <ol style="margin:0 0 12px 22px;padding:0;font-size:13px;line-height:1.7">
-      <li>System Settings just opened (or click <button onclick="openPrivacySettings()" style="padding:2px 10px;border-radius:4px;border:1px solid #fb923c;background:#fff;cursor:pointer">Open Privacy Settings</button>)</li>
-      <li>Scroll to <b>Full Disk Access</b></li>
-      <li>Click the <b>+</b> button</li>
-      <li>Press <b>Cmd+Shift+G</b>, paste this path, and hit Enter:
-        <div style="display:flex;gap:6px;margin:6px 0;align-items:center">
-          <code id="pythonPath" style="flex:1;padding:6px 10px;background:#fff;border:1px solid #fed7aa;border-radius:4px;font-size:12px;user-select:all">${escapeHtml(pythonPath)}</code>
+    <p style="margin:0 0 14px;font-size:13px">macOS protects <b>Documents</b>, <b>Desktop</b>, and <b>Downloads</b> behind a privacy permission. Grant <b>Full Disk Access</b> to the Python interpreter that runs mhealth.</p>
+
+    <div style="background:#fff;border:1px solid #fb923c;border-radius:8px;padding:12px;margin-bottom:14px">
+      <div style="font-weight:600;margin-bottom:8px;color:#7c2d12">⭐ Easy way — drag &amp; drop:</div>
+      <ol style="margin:0 0 6px 22px;padding:0;font-size:13px;line-height:1.7">
+        <li>
+          <button onclick="revealPython()" style="padding:4px 12px;border-radius:4px;border:1px solid #fb923c;background:#fff;cursor:pointer;font-weight:500">📂 Show python3 in Finder</button>
+          — opens a Finder window with python3 highlighted
+        </li>
+        <li>
+          <button onclick="openPrivacySettings()" style="padding:4px 12px;border-radius:4px;border:1px solid #fb923c;background:#fff;cursor:pointer;font-weight:500">⚙️ Open Privacy Settings</button>
+          — opens System Settings → Privacy &amp; Security
+        </li>
+        <li>Scroll to <b>Full Disk Access</b> in Settings</li>
+        <li><b>Drag</b> the highlighted <code>python3</code> from Finder <b>into</b> the Full Disk Access list (no need to click +)</li>
+        <li>Make sure the toggle next to it is <b>ON</b></li>
+        <li><button onclick="restartServerAndRescan('${escapeHtml(path)}')" style="padding:4px 12px;border-radius:4px;border:1px solid #fb923c;background:#fb923c;color:#fff;cursor:pointer;font-weight:500">Restart server &amp; rescan</button></li>
+      </ol>
+    </div>
+
+    <details style="font-size:12px;color:#92400e;margin-top:6px">
+      <summary style="cursor:pointer">Manual path (if drag-and-drop doesn't work)</summary>
+      <div style="margin-top:8px">
+        In Privacy &amp; Security → Full Disk Access → click <b>+</b> → press <b>Cmd+Shift+G</b> → paste path → Enter → select python3 → Open.
+      </div>
+      <div style="margin-top:6px">
+        <div style="font-size:11px;color:#7c2d12;margin-bottom:2px">Symlink path (what mhealth reports):</div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <code style="flex:1;padding:6px 10px;background:#fff;border:1px solid #fed7aa;border-radius:4px;font-size:12px;user-select:all">${escapeHtml(pythonPath)}</code>
           <button onclick="copyTextToClipboard('${escapeHtml(pythonPath)}', this)" style="padding:4px 10px;border-radius:4px;border:1px solid #fb923c;background:#fff;cursor:pointer">Copy</button>
         </div>
-      </li>
-      <li>Select <b>python3</b> in the file picker and click <b>Open</b></li>
-      <li>Make sure the toggle next to it is <b>ON</b></li>
-      <li>Come back and click <button onclick="restartServerAndRescan('${escapeHtml(path)}')" style="padding:4px 10px;border-radius:4px;border:1px solid #fb923c;background:#fb923c;color:#fff;cursor:pointer">Restart server &amp; rescan</button></li>
-    </ol>
+      </div>
+      ${pythonRealPath !== pythonPath ? `
+      <div style="margin-top:6px">
+        <div style="font-size:11px;color:#7c2d12;margin-bottom:2px">Resolved real path (use this if symlink doesn't work):</div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <code style="flex:1;padding:6px 10px;background:#fff;border:1px solid #fed7aa;border-radius:4px;font-size:12px;user-select:all">${escapeHtml(pythonRealPath)}</code>
+          <button onclick="copyTextToClipboard('${escapeHtml(pythonRealPath)}', this)" style="padding:4px 10px;border-radius:4px;border:1px solid #fb923c;background:#fff;cursor:pointer">Copy</button>
+        </div>
+      </div>` : ""}
+    </details>
+
     <details style="font-size:12px;color:#92400e;margin-top:8px">
       <summary style="cursor:pointer">Why? + raw error</summary>
       <p style="margin:6px 0">macOS's TCC (Transparency, Consent &amp; Control) blocks background services from reading Documents/Desktop/Downloads without explicit user consent. The mhealth server runs under launchd, so the consent must be granted to <code>python3</code> directly, not to mhealth.</p>
@@ -3304,8 +3333,16 @@ async function showTccHelp(path, rawError) {
     </details>
   `;
   el.style.display = "block";
-  // Auto-trigger Privacy Settings (it'll noop if user dismissed and re-tried)
-  fetch("/system/open-privacy-settings").catch(() => {});
+}
+
+async function revealPython() {
+  try {
+    const r = await fetch("/system/reveal-python");
+    const j = await r.json();
+    if (!j.ok) alert("Couldn't reveal python: " + (j.path || ""));
+  } catch (e) {
+    alert("Reveal failed: " + e.message);
+  }
 }
 
 async function openPrivacySettings() {
@@ -4072,16 +4109,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/cloud/pick-folder":
             self._send(200, json.dumps(pick_folder()).encode(), "application/json")
         elif self.path == "/system/open-privacy-settings":
-            # Open System Settings → Privacy & Security → Full Disk Access
+            # Try multiple URL schemes / fallbacks — macOS Settings names vary by version.
+            ok = False
+            for cmd in [
+                ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"],
+                ["open", "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension"],
+                ["open", "-b", "com.apple.systempreferences"],
+            ]:
+                try:
+                    r = subprocess.run(cmd, capture_output=True, timeout=5)
+                    if r.returncode == 0:
+                        ok = True
+                        break
+                except Exception:
+                    continue
+            real = os.path.realpath(sys.executable)
+            self._send(200, json.dumps({
+                "ok": ok,
+                "python_path": sys.executable,
+                "python_real_path": real,
+            }).encode(), "application/json")
+        elif self.path == "/system/reveal-python":
+            # Open Finder with python3 highlighted, ready to drag into Privacy settings.
+            real = os.path.realpath(sys.executable)
             try:
-                subprocess.Popen([
-                    "open",
-                    "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
-                ])
+                subprocess.Popen(["open", "-R", real])
                 ok = True
             except Exception:
                 ok = False
-            self._send(200, json.dumps({"ok": ok, "python_path": sys.executable}).encode(), "application/json")
+            self._send(200, json.dumps({"ok": ok, "path": real}).encode(), "application/json")
         elif self.path == "/snooze":
             self._send(200, json.dumps(snooze_status()).encode(), "application/json")
         elif self.path == "/ping":

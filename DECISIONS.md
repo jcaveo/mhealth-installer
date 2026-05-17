@@ -4,6 +4,25 @@ Append-only per CLAUDE.md. New entries on top.
 
 ---
 
+## 2026-05-17 — TCC help: reveal-python + drag-and-drop flow
+
+**Status:** completed
+**Changes:**
+- Symlinked python path can be misleading — added `python_real_path` (os.path.realpath of sys.executable) alongside the symlink in `/system/open-privacy-settings`. On JC's Mac: symlink `/Library/Developer/CommandLineTools/usr/bin/python3` → real `/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9`.
+- New endpoint `GET /system/reveal-python` runs `open -R <real_path>` to highlight python3 in Finder.
+- TCC help card restructured:
+  - **Primary path (easy way)**: Show python3 in Finder → Open Privacy Settings → drag python3 from Finder into Full Disk Access list. No typing, no Cmd+Shift+G.
+  - **Fallback (collapsed details)**: Cmd+Shift+G manual path entry with BOTH the symlink and resolved real paths (in case TCC needs one or the other), each with a Copy button.
+- `open-privacy-settings` now tries 3 URL schemes in sequence (legacy `Privacy_AllFiles`, modern `PrivacySecurity.extension`, generic `-b com.apple.systempreferences`) for cross-macOS-version compatibility.
+- Stopped auto-firing Privacy Settings on help-card render — annoying. Now user clicks the button when ready.
+
+**Why:**
+- User reported Cmd+Shift+G "doesn't work" and couldn't find the Developer folder in the file picker
+- The symlinked path may not be what TCC actually validates against (some macOS versions resolve symlinks)
+- Drag-and-drop is the actual idiomatic macOS UX for granting Full Disk Access — typing paths is a power-user fallback
+
+---
+
 ## 2026-05-17 — Revert: keep activity logger ON by default (tab still hidden)
 
 **Status:** completed
