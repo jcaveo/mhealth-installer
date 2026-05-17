@@ -1468,6 +1468,64 @@ def scan_home_overview() -> dict:
     return {"ok": True, "home": home, "items": items}
 
 
+# --- TCC: figure out what binary macOS actually validates against -------
+
+def _tcc_paths_for_self() -> dict:
+    """Return all the candidate paths involved in TCC for this running process.
+    Reports:
+      sys_executable       – what Python thinks it is (often a symlink)
+      sys_executable_real  – os.path.realpath of the above
+      running_binary       – what `ps` says is actually running (may differ on macOS
+                             when Python re-execs through Python.app)
+      tcc_target           – best path to grant TCC against; prefers the
+                             enclosing .app bundle if one exists.
+    """
+    import shlex
+    info: dict = {
+        "sys_executable": sys.executable,
+        "sys_executable_real": os.path.realpath(sys.executable),
+        "running_binary": None,
+        "tcc_target": None,
+        "running_app_bundle": None,
+    }
+    # `ps -o comm=` returns the first arg of the running process (the actual exec path)
+    try:
+        r = subprocess.run(
+            ["ps", "-p", str(os.getpid()), "-o", "comm="],
+            capture_output=True, text=True, timeout=2,
+        )
+        if r.returncode == 0:
+            info["running_binary"] = r.stdout.strip() or None
+    except Exception:
+        pass
+
+    # Walk up the directory tree looking for an enclosing .app bundle.
+    # If we're running inside Python.app/Contents/MacOS/Python, the .app is the
+    # right TCC target — macOS shows that as the app icon in Privacy & Security.
+    def _enclosing_app(path: str) -> str | None:
+        d = os.path.dirname(path)
+        while d and d != "/":
+            if d.endswith(".app"):
+                return d
+            d = os.path.dirname(d)
+        return None
+
+    for candidate in (info["running_binary"], info["sys_executable_real"], info["sys_executable"]):
+        if not candidate:
+            continue
+        app = _enclosing_app(candidate)
+        if app:
+            info["running_app_bundle"] = app
+            info["tcc_target"] = app
+            break
+
+    # No .app found → grant to the running binary itself.
+    if info["tcc_target"] is None:
+        info["tcc_target"] = info["running_binary"] or info["sys_executable_real"] or info["sys_executable"]
+
+    return info
+
+
 # --- Notification snooze --------------------------------------------------
 
 SNOOZE_FILE = os.path.join(READLATER_DIR, "snoozed-until")
@@ -3273,66 +3331,124 @@ async function showTccHelp(path, rawError) {
     const anchor = document.getElementById("scanTable");
     anchor.parentNode.insertBefore(el, anchor);
   }
-  // Get the actual python path(s) from the server
-  let pythonPath = "/usr/bin/python3";
-  let pythonRealPath = pythonPath;
+  // Get the actual python paths from the server. Critically, tcc_target prefers an
+  // enclosing .app bundle if the running process is inside one — macOS TCC validates
+  // against the .app, not the bin/python3 symlink.
+  let info = {
+    sys_executable: "/usr/bin/python3",
+    sys_executable_real: "/usr/bin/python3",
+    running_binary: null,
+    tcc_target: "/usr/bin/python3",
+    running_app_bundle: null,
+  };
   try {
     const r = await fetch("/system/open-privacy-settings");
-    const j = await r.json();
-    if (j.python_path) pythonPath = j.python_path;
-    if (j.python_real_path) pythonRealPath = j.python_real_path;
+    info = { ...info, ...(await r.json()) };
   } catch {}
+  const isAppBundle = !!info.running_app_bundle;
+  const grantTarget = info.tcc_target;
+  const grantTargetName = grantTarget.split("/").pop();
+  const grantWhat = isAppBundle ? "the Python.app bundle" : "python3";
   el.innerHTML = `
     <h3 style="margin:0 0 10px;font-size:15px;color:#7c2d12">🔒 macOS is blocking access to <code>${escapeHtml(path)}</code></h3>
-    <p style="margin:0 0 14px;font-size:13px">macOS protects <b>Documents</b>, <b>Desktop</b>, and <b>Downloads</b> behind a privacy permission. Grant <b>Full Disk Access</b> to the Python interpreter that runs mhealth.</p>
+    <p style="margin:0 0 8px;font-size:13px">macOS protects <b>Documents</b>, <b>Desktop</b>, and <b>Downloads</b> behind Full Disk Access. The running mhealth process is:</p>
+    <div style="background:#fff;border:1px solid #fed7aa;border-radius:6px;padding:8px 12px;margin-bottom:14px;font-size:11px;font-family:ui-monospace,Menlo,monospace;word-break:break-all">
+      ${escapeHtml(info.running_binary || info.sys_executable_real)}
+      ${isAppBundle ? `<div style="margin-top:6px;color:#16a34a;font-family:inherit;font-size:12px"><b>⚠️ This binary lives inside a <code>.app</code> bundle.</b> macOS TCC validates against the <code>.app</code>, not the inner binary. <b>You must drag the .app, not python3.</b></div>` : ""}
+    </div>
 
     <div style="background:#fff;border:1px solid #fb923c;border-radius:8px;padding:12px;margin-bottom:14px">
-      <div style="font-weight:600;margin-bottom:8px;color:#7c2d12">⭐ Easy way — drag &amp; drop:</div>
+      <div style="font-weight:600;margin-bottom:8px;color:#7c2d12">⭐ Steps:</div>
       <ol style="margin:0 0 6px 22px;padding:0;font-size:13px;line-height:1.7">
         <li>
-          <button onclick="revealPython()" style="padding:4px 12px;border-radius:4px;border:1px solid #fb923c;background:#fff;cursor:pointer;font-weight:500">📂 Show python3 in Finder</button>
-          — opens a Finder window with python3 highlighted
+          <button onclick="revealPython()" style="padding:4px 12px;border-radius:4px;border:1px solid #fb923c;background:#fff;cursor:pointer;font-weight:500">📂 Show ${escapeHtml(grantTargetName)} in Finder</button>
+          — opens Finder with ${escapeHtml(grantWhat)} highlighted
         </li>
         <li>
           <button onclick="openPrivacySettings()" style="padding:4px 12px;border-radius:4px;border:1px solid #fb923c;background:#fff;cursor:pointer;font-weight:500">⚙️ Open Privacy Settings</button>
           — opens System Settings → Privacy &amp; Security
         </li>
         <li>Scroll to <b>Full Disk Access</b> in Settings</li>
-        <li><b>Drag</b> the highlighted <code>python3</code> from Finder <b>into</b> the Full Disk Access list (no need to click +)</li>
+        <li><b>${isAppBundle ? "If <code>python3</code> is already in the list, remove it first (click − while it's selected)." : "If a stale <code>python3</code> entry exists, remove it first."}</b></li>
+        <li><b>Drag</b> the highlighted <code>${escapeHtml(grantTargetName)}</code> from Finder <b>into</b> the Full Disk Access list</li>
         <li>Make sure the toggle next to it is <b>ON</b></li>
         <li><button onclick="restartServerAndRescan('${escapeHtml(path)}')" style="padding:4px 12px;border-radius:4px;border:1px solid #fb923c;background:#fb923c;color:#fff;cursor:pointer;font-weight:500">Restart server &amp; rescan</button></li>
+        <li style="color:#7c2d12;font-size:12px">Still not working? <button onclick="runTccDiagnose()" style="padding:2px 8px;border-radius:4px;border:1px solid #fb923c;background:#fff;cursor:pointer">🔍 Diagnose</button></li>
       </ol>
     </div>
 
+    <div id="tccDiagnoseOutput" style="display:none;background:#1f2937;color:#e5e7eb;border-radius:8px;padding:12px 16px;margin-bottom:14px;font-family:ui-monospace,Menlo,monospace;font-size:11px;white-space:pre-wrap;overflow:auto;max-height:300px"></div>
+
     <details style="font-size:12px;color:#92400e;margin-top:6px">
-      <summary style="cursor:pointer">Manual path (if drag-and-drop doesn't work)</summary>
+      <summary style="cursor:pointer">Manual path (advanced)</summary>
       <div style="margin-top:8px">
-        In Privacy &amp; Security → Full Disk Access → click <b>+</b> → press <b>Cmd+Shift+G</b> → paste path → Enter → select python3 → Open.
+        In Privacy &amp; Security → Full Disk Access → click <b>+</b> → Cmd+Shift+G → paste path → Enter.
       </div>
       <div style="margin-top:6px">
-        <div style="font-size:11px;color:#7c2d12;margin-bottom:2px">Symlink path (what mhealth reports):</div>
+        <div style="font-size:11px;color:#7c2d12;margin-bottom:2px"><b>Best target</b> (what macOS validates against):</div>
         <div style="display:flex;gap:6px;align-items:center">
-          <code style="flex:1;padding:6px 10px;background:#fff;border:1px solid #fed7aa;border-radius:4px;font-size:12px;user-select:all">${escapeHtml(pythonPath)}</code>
-          <button onclick="copyTextToClipboard('${escapeHtml(pythonPath)}', this)" style="padding:4px 10px;border-radius:4px;border:1px solid #fb923c;background:#fff;cursor:pointer">Copy</button>
+          <code style="flex:1;padding:6px 10px;background:#fff;border:1px solid #fed7aa;border-radius:4px;font-size:12px;user-select:all">${escapeHtml(grantTarget)}</code>
+          <button onclick="copyTextToClipboard('${escapeHtml(grantTarget)}', this)" style="padding:4px 10px;border-radius:4px;border:1px solid #fb923c;background:#fff;cursor:pointer">Copy</button>
         </div>
       </div>
-      ${pythonRealPath !== pythonPath ? `
-      <div style="margin-top:6px">
-        <div style="font-size:11px;color:#7c2d12;margin-bottom:2px">Resolved real path (use this if symlink doesn't work):</div>
-        <div style="display:flex;gap:6px;align-items:center">
-          <code style="flex:1;padding:6px 10px;background:#fff;border:1px solid #fed7aa;border-radius:4px;font-size:12px;user-select:all">${escapeHtml(pythonRealPath)}</code>
-          <button onclick="copyTextToClipboard('${escapeHtml(pythonRealPath)}', this)" style="padding:4px 10px;border-radius:4px;border:1px solid #fb923c;background:#fff;cursor:pointer">Copy</button>
-        </div>
-      </div>` : ""}
+      <div style="margin-top:6px;font-size:11px;color:#92400e">Other paths involved:</div>
+      <div style="margin-top:2px;font-size:11px;font-family:ui-monospace,Menlo,monospace;color:#92400e">
+        sys.executable:&nbsp;${escapeHtml(info.sys_executable)}<br>
+        realpath:&nbsp;${escapeHtml(info.sys_executable_real)}<br>
+        ${info.running_binary ? `running:&nbsp;${escapeHtml(info.running_binary)}<br>` : ""}
+        ${info.running_app_bundle ? `app:&nbsp;${escapeHtml(info.running_app_bundle)}` : ""}
+      </div>
     </details>
 
     <details style="font-size:12px;color:#92400e;margin-top:8px">
       <summary style="cursor:pointer">Why? + raw error</summary>
-      <p style="margin:6px 0">macOS's TCC (Transparency, Consent &amp; Control) blocks background services from reading Documents/Desktop/Downloads without explicit user consent. The mhealth server runs under launchd, so the consent must be granted to <code>python3</code> directly, not to mhealth.</p>
+      <p style="margin:6px 0">macOS's TCC (Transparency, Consent &amp; Control) blocks background services from reading Documents/Desktop/Downloads without explicit user consent. TCC validates against the <i>actually-running</i> binary or its enclosing <code>.app</code> bundle — not necessarily what <code>which python3</code> or symlinks point at.</p>
       <p style="margin:6px 0"><b>Raw error:</b> ${escapeHtml(rawError || "")}</p>
     </details>
   `;
   el.style.display = "block";
+}
+
+async function runTccDiagnose() {
+  const out = document.getElementById("tccDiagnoseOutput");
+  if (!out) return;
+  out.style.display = "block";
+  out.textContent = "Running diagnostic…";
+  try {
+    const r = await fetch("/system/tcc-diagnose");
+    const j = await r.json();
+    const reads = j.reads || {};
+    const lines = [];
+    lines.push("=== Permission test (what the server can ACTUALLY read right now) ===");
+    for (const [name, res] of Object.entries(reads)) {
+      const icon = res.ok === true ? "✓" : res.ok === null ? "—" : "✗";
+      lines.push(`  ${icon} ~/${name.padEnd(10)} ${res.ok ? "OK" : "BLOCKED: " + (res.error || "")}`);
+    }
+    lines.push("");
+    lines.push("=== Running process ===");
+    lines.push(`  sys.executable:        ${j.sys_executable}`);
+    lines.push(`  realpath:              ${j.sys_executable_real}`);
+    if (j.running_binary) lines.push(`  ps reports running:    ${j.running_binary}`);
+    if (j.running_app_bundle) lines.push(`  enclosing .app bundle: ${j.running_app_bundle}`);
+    lines.push(`  TCC target (best):     ${j.tcc_target}`);
+    lines.push("");
+    const allOk = Object.values(reads).every(r => r.ok !== false);
+    if (allOk) {
+      lines.push("✅ All protected directories are readable. Try Scan again.");
+    } else {
+      lines.push("❌ Still blocked. Common fixes:");
+      lines.push("   1. In Privacy → Full Disk Access, REMOVE any stale python3 entries");
+      lines.push("      (click the − button after selecting them).");
+      lines.push("   2. Drag the file shown as 'TCC target (best)' from Finder into the list.");
+      lines.push("   3. Toggle it ON.");
+      lines.push("   4. Click Restart server & rescan.");
+      lines.push("   5. If STILL blocked: log out and back in, or reboot. macOS TCC");
+      lines.push("      sometimes caches old grants and needs a full session restart.");
+    }
+    out.textContent = lines.join("\n");
+  } catch (e) {
+    out.textContent = "Diagnose failed: " + e.message;
+  }
 }
 
 async function revealPython() {
@@ -4149,7 +4265,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/cloud/pick-folder":
             self._send(200, json.dumps(pick_folder()).encode(), "application/json")
         elif self.path == "/system/open-privacy-settings":
-            # Try multiple URL schemes / fallbacks — macOS Settings names vary by version.
             ok = False
             for cmd in [
                 ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"],
@@ -4163,21 +4278,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         break
                 except Exception:
                     continue
-            real = os.path.realpath(sys.executable)
-            self._send(200, json.dumps({
-                "ok": ok,
-                "python_path": sys.executable,
-                "python_real_path": real,
-            }).encode(), "application/json")
+            paths = _tcc_paths_for_self()
+            self._send(200, json.dumps({"ok": ok, **paths}).encode(), "application/json")
         elif self.path == "/system/reveal-python":
-            # Open Finder with python3 highlighted, ready to drag into Privacy settings.
-            real = os.path.realpath(sys.executable)
+            # Reveal the BEST TCC target — preferring an enclosing .app bundle.
+            paths = _tcc_paths_for_self()
+            target = paths.get("tcc_target") or paths.get("running_binary") or sys.executable
             try:
-                subprocess.Popen(["open", "-R", real])
+                subprocess.Popen(["open", "-R", target])
                 ok = True
             except Exception:
                 ok = False
-            self._send(200, json.dumps({"ok": ok, "path": real}).encode(), "application/json")
+            self._send(200, json.dumps({"ok": ok, "path": target, **paths}).encode(), "application/json")
+        elif self.path == "/system/tcc-diagnose":
+            # Test which protected directories we can actually read right now.
+            home = os.path.expanduser("~")
+            results = {}
+            for name in ("Desktop", "Documents", "Downloads"):
+                p = os.path.join(home, name)
+                try:
+                    os.listdir(p)
+                    results[name] = {"ok": True, "error": None}
+                except PermissionError as e:
+                    results[name] = {"ok": False, "error": e.strerror or str(e)}
+                except FileNotFoundError:
+                    results[name] = {"ok": None, "error": "directory missing"}
+                except Exception as e:
+                    results[name] = {"ok": False, "error": str(e)}
+            paths = _tcc_paths_for_self()
+            self._send(200, json.dumps({"reads": results, **paths}).encode(), "application/json")
         elif self.path == "/snooze":
             self._send(200, json.dumps(snooze_status()).encode(), "application/json")
         elif self.path == "/ping":

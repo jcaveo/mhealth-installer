@@ -4,6 +4,28 @@ Append-only per CLAUDE.md. New entries on top.
 
 ---
 
+## 2026-05-17 — TCC: detect Python.app + diagnostic flow
+
+**Status:** completed
+**Root cause discovered:** On macOS, CommandLineTools Python re-execs through `Python3.framework/.../Resources/Python.app/Contents/MacOS/Python` even when launchd starts `bin/python3.9`. `ps -p <pid> -o comm=` shows the actual running binary is the .app's inner executable. **TCC validates against the enclosing .app bundle, not the symlink** the user dragged in. So a Full Disk Access grant for `python3` (symlink) silently doesn't apply to the running process.
+
+**Changes:**
+- New `_tcc_paths_for_self()` helper — reports `sys_executable`, `sys_executable_real`, `running_binary` (via `ps -o comm=`), `running_app_bundle` (walk up looking for `.app`), and `tcc_target` (prefers the .app over the binary).
+- `/system/open-privacy-settings` + `/system/reveal-python` now return + reveal the **best TCC target** (the .app if applicable).
+- New `GET /system/tcc-diagnose` endpoint — tries `os.listdir()` on ~/Desktop, ~/Documents, ~/Downloads and reports which are blocked, plus all the paths involved.
+- TCC help card heavily revised:
+  - Top banner shows the actual running binary path with a green warning when it's inside a `.app`: "⚠️ This binary lives inside a .app bundle. macOS TCC validates against the .app, not the inner binary. You must drag the .app, not python3."
+  - "Show Python.app in Finder" button reveals the right thing
+  - Instructions explicitly say to REMOVE any stale `python3` entries from the Privacy list first
+  - New "🔍 Diagnose" button calls `/system/tcc-diagnose` and prints a black-terminal-style report showing exactly which dirs are readable + what to do next
+
+**Verified on JC's Mac:**
+- `tcc_target` correctly = `/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app`
+- diagnose shows Documents=OK, Desktop=BLOCKED, Downloads=BLOCKED — confirming the prior grant of the `python3` symlink didn't apply to the running .app
+- User needs to: remove stale python3 entry → drag Python.app → toggle ON → restart server & rescan
+
+---
+
 ## 2026-05-17 — One-click server restart (no more Terminal commands)
 
 **Status:** completed
