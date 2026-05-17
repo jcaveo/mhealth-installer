@@ -4,6 +4,40 @@ Append-only per CLAUDE.md. New entries on top.
 
 ---
 
+## 2026-05-17 — Bulletproof teammate install: install.sh + dashboard self-heal banner
+
+**Status:** completed
+**Why:** user explicitly said "I don't want to deal with 10 people's Mac problems." Three layers of defense:
+
+**1. One-paste installer (`install.sh`):**
+- macOS-only guard
+- Installs Homebrew if missing (official one-liner; needs sudo)
+- Installs `brew install python` if missing (or if existing python3 is just a CommandLineTools symlink)
+- Downloads `mhealth-installer.pkg` from GitHub raw URL (or `MHEALTH_PKG_URL` env override)
+- Opens the .pkg → user clicks through Gatekeeper + install
+- One Slack message to teammates: paste this in Terminal, done
+
+**2. Loud `mhealth-setup` warning (already in place from previous decision):**
+- If only Apple Python is found, postinstall message explicitly says scans of ~/Desktop / ~/Downloads will fail
+- Tells user the fix: `brew install python && mhealth-setup`
+
+**3. Dashboard self-heal banner (`/system/python-health` + JS):**
+- On every page load (and every 60s), client checks `/system/python-health`
+- Server detects if `running_binary` is Apple's (CommandLineTools or /usr/bin) AND whether brew Python is available
+- If Apple Python: shows a big red banner at top of every tab with the exact Terminal fix command + copy button
+- Two variants:
+  - Brew installed but mhealth not using it: `mhealth-setup && launchctl kickstart …`
+  - Brew not installed: `brew install python && mhealth-setup && launchctl kickstart …`
+- Banner disappears the moment user fixes it (the 60s recheck catches it)
+
+**Verified:** `python-health` endpoint correctly reports `is_apple_python: false` on JC's Mac (already running brew Python). For a fresh install on a Mac with only Apple Python, banner will show + auto-recover after the user pastes the one-liner.
+
+**End-user friction now:**
+- Best case (use install.sh): one paste, click through pkg install, done
+- Worst case (manually installed pkg without brew Python first): big red banner appears with the exact paste-to-fix command
+
+---
+
 ## 2026-05-17 — Root cause fix: ALWAYS use brew Python (Apple's silently fails TCC)
 
 **Status:** completed

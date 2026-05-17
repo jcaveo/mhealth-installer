@@ -1771,6 +1771,17 @@ HTML = r"""<!DOCTYPE html>
 
   <div class="summary" id="summary"></div>
 
+  <!-- Apple-Python warning banner. Shown only if the running mhealth process is
+       Apple's CommandLineTools Python (which silently fails TCC grants). -->
+  <div id="applePythonBanner" style="display:none;background:#fef2f2;border:2px solid #ef4444;border-radius:10px;padding:12px 16px;margin:10px 0;color:#7f1d1d">
+    <div style="font-weight:600;margin-bottom:6px;font-size:14px">⚠️ Folder scanning won't work until you switch Python</div>
+    <div style="font-size:13px;line-height:1.5;margin-bottom:10px">
+      mhealth is running under <b>Apple's system Python</b>. macOS silently ignores Full Disk Access grants for it — so scans of <code>~/Desktop</code> / <code>~/Downloads</code> will always fail no matter what permissions you set.
+      <span id="applePythonBrewState"></span>
+    </div>
+    <div id="applePythonFixBox"></div>
+  </div>
+
   <div id="hintBanner" class="banner" style="display:none">
     <span>💡 Tab→PID mapping is OFF for this browser. Enable View → Developer → "Allow JavaScript from Apple Events" for renderer hints.</span>
     <a onclick="this.parentElement.style.display='none'">Dismiss</a>
@@ -2756,6 +2767,42 @@ if (window.__ENABLE_TIME_SPENT__) {
   const t = document.getElementById("timeSpentTab");
   if (t) t.style.display = "";
 }
+
+// Apple-Python health check — surface the brew-Python fix prominently so
+// teammates aren't left wondering why their TCC grants don't work.
+async function checkPythonHealth() {
+  try {
+    const r = await fetch("/system/python-health");
+    const j = await r.json();
+    const banner = document.getElementById("applePythonBanner");
+    if (!banner) return;
+    if (!j.is_apple_python) {
+      banner.style.display = "none";
+      return;
+    }
+    // Apple Python is in use — surface the fix
+    const stateEl = document.getElementById("applePythonBrewState");
+    const fixEl = document.getElementById("applePythonFixBox");
+    if (j.brew_python_available) {
+      stateEl.innerHTML = ` Brew Python <b>is installed</b> at <code>${escapeHtml(j.brew_python_path)}</code> but mhealth isn't using it.`;
+      fixEl.innerHTML = `
+        <div style="font-size:12px;margin-bottom:8px"><b>Fix:</b> open Terminal and run this — it switches mhealth to brew Python and restarts (no reinstall).</div>
+        ${codeBlockWithCopy("mhealth-setup && launchctl kickstart -k \"gui/$(id -u)/com.mhealth.server\"")}`;
+    } else {
+      stateEl.innerHTML = ` Brew Python is <b>not installed</b>.`;
+      fixEl.innerHTML = `
+        <div style="font-size:12px;margin-bottom:8px"><b>Fix:</b> open Terminal and run this one line — installs brew Python (if you don't have it), reconfigures mhealth, restarts.</div>
+        ${codeBlockWithCopy("brew install python && mhealth-setup && launchctl kickstart -k \"gui/$(id -u)/com.mhealth.server\"")}
+        <div style="font-size:11px;margin-top:6px;color:#92400e">No Homebrew yet? Install from <a href="https://brew.sh" target="_blank" rel="noopener" style="color:#7f1d1d">brew.sh</a> first.</div>`;
+    }
+    banner.style.display = "block";
+  } catch (e) {
+    // silent
+  }
+}
+checkPythonHealth();
+// Re-check every 60 s in case user fixes it
+setInterval(checkPythonHealth, 60 * 1000);
 
 // Hover effect for menu items
 document.addEventListener("mouseover", (e) => {
@@ -4280,6 +4327,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     continue
             paths = _tcc_paths_for_self()
             self._send(200, json.dumps({"ok": ok, **paths}).encode(), "application/json")
+        elif self.path == "/system/python-health":
+            # Detect whether the running Python is Apple's (which silently fails TCC).
+            paths = _tcc_paths_for_self()
+            running = paths.get("running_binary") or paths.get("sys_executable_real") or ""
+            is_apple_python = (
+                "/CommandLineTools/" in running or
+                running.startswith("/usr/bin/python")
+            )
+            # Is brew Python installed?
+            brew_python = None
+            for cand in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
+                if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                    # Make sure it's not just a symlink to Apple's
+                    real = os.path.realpath(cand)
+                    if "/CommandLineTools/" not in real:
+                        brew_python = cand
+                        break
+            self._send(200, json.dumps({
+                "is_apple_python": is_apple_python,
+                "brew_python_available": brew_python is not None,
+                "brew_python_path": brew_python,
+                "running_binary": running,
+            }).encode(), "application/json")
         elif self.path == "/system/reveal-python":
             # Reveal the BEST TCC target — preferring an enclosing .app bundle.
             paths = _tcc_paths_for_self()

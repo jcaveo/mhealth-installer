@@ -5,6 +5,28 @@ Single-machine local web UI at `http://127.0.0.1:8765/`.
 
 ---
 
+## ⭐ Quickest install — one command
+
+Paste this in Terminal:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/jcaveo/mhealth-installer/main/install.sh)
+```
+
+(If the repo is private, JC will send you `install.sh` via Slack — save it, then run `bash install.sh`.)
+
+This handles **everything**:
+1. Installs Homebrew if missing
+2. Installs Homebrew Python (needed — see §0 below for why)
+3. Downloads `mhealth-installer.pkg`
+4. Opens the installer — you click through
+
+After install: open `http://127.0.0.1:8765/`.
+
+If you'd rather do it manually, follow the numbered sections below.
+
+---
+
 ## 0. Prerequisite — install Homebrew Python (important)
 
 Before installing mhealth, install Python via Homebrew:
