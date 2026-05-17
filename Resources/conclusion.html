@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>mhealth installed</title>
+<style>
+  body { font: 13px/1.5 -apple-system, BlinkMacSystemFont, sans-serif; padding: 20px 24px; color: #1d1d1f; }
+  h2 { font-size: 17px; margin: 0 0 12px; }
+  h3 { font-size: 13px; margin: 18px 0 6px; color: #444; }
+  ul { padding-left: 22px; margin: 6px 0; }
+  li { margin: 3px 0; }
+  code { background: #f4f4f4; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+  .ok { color: #1a7f37; }
+</style></head>
+<body>
+<h2 class="ok">mhealth is running.</h2>
+
+<p>The dashboard is live at <code>http://127.0.0.1:8765/</code> — open it in your browser.</p>
+
+<h3>Useful commands (Terminal)</h3>
+<ul>
+  <li><code>mhealth</code> — print current health snapshot</li>
+  <li><code>mhealth-kill</code> — open the dashboard</li>
+  <li><code>mhealth-setup</code> — re-load LaunchAgents (after updates)</li>
+  <li><code>mhealth-uninstall</code> — remove this user's setup</li>
+</ul>
+
+<h3>Permissions (recap)</h3>
+<p>Open <b>System Settings → Privacy &amp; Security</b> and grant Screen Recording, Automation,
+and Accessibility to <code>launchd</code> / <code>Python</code> / <code>bash</code> when prompted.
+Without them, the tools still run but show fewer details.</p>
+
+<h3>Logs</h3>
+<ul>
+  <li><code>~/Library/Logs/mac-health-watcher.log</code> — every 5 min health sample</li>
+  <li><code>~/Library/Logs/mhealth-activity.csv</code> — every 60 s activity row</li>
+</ul>
+
+<p>Both auto-prune to 15 days.</p>
+</body></html>

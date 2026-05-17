@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""
+mhealth-activity — log frontmost app, window title, idle state.
+Runs every 60 s via launchd.
+
+Output: ~/Library/Logs/mhealth-activity.csv
+
+Columns: timestamp,app,window_title,idle_sec,browser_tab,browser_url
+A row is logged regardless of idle state — the consumer can filter by idle_sec
+to compute "active time" vs "open time".
+
+Auto-prune: every hour, drop rows older than RETENTION_DAYS.
+The watcher log is pruned with the same retention.
+"""
+from __future__ import annotations
+
+import csv
+import datetime
+import os
+import re
+import subprocess
+import sys
+
+LOG = os.path.expanduser("~/Library/Logs/mhealth-activity.csv")
+WATCHER_LOG = os.path.expanduser("~/Library/Logs/mac-health-watcher.log")
+RETENTION_DAYS = 15
+
+FIELDS = ["timestamp", "app", "window_title", "idle_sec", "browser_tab", "browser_url"]
+
+
+def osa(script: str, timeout: int = 3) -> str:
+    try:
+        return subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=timeout,
+        ).stdout.strip()
+    except Exception:
+        return ""
+
+
+def get_frontmost_app() -> str:
+    return osa('tell application "System Events" to '
+               'return name of first application process whose frontmost is true')
+
+
+def get_window_title(app: str) -> str:
+    if not app:
+        return ""
+    # Escape double-quotes in app name
+    safe = app.replace('"', '\\"')
+    return osa(
+        f'tell application "System Events" to tell process "{safe}" to '
+        f'try\n return name of front window\n on error\n return ""\n end try'
+    )
+
+
+def get_idle_sec() -> int:
+    try:
+        out = subprocess.run(
+            ["ioreg", "-c", "IOHIDSystem"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+        m = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', out)
+        if m:
+            return int(m.group(1)) // 1_000_000_000
+    except Exception:
+        pass
+    return 0
+
+
+def get_browser_active_tab(app: str) -> tuple[str, str]:
+    """Returns (title, url) for the active tab of a Chromium-based browser."""
+    name_map = {
+        "Google Chrome": "Google Chrome",
+        "Brave Browser": "Brave Browser",
+        "Microsoft Edge": "Microsoft Edge",
+        "Vivaldi": "Vivaldi",
+    }
+    target = next((v for k, v in name_map.items() if k in app), None)
+    if not target:
+        return "", ""
+    title = osa(f'tell application "{target}" to return title of active tab of front window')
+    url = osa(f'tell application "{target}" to return URL of active tab of front window')
+    return title, url
+
+
+def prune_csv(path: str, retention_days: int) -> None:
+    if not os.path.exists(path):
+        return
+    cutoff = (datetime.datetime.now() - datetime.timedelta(days=retention_days)).isoformat()
+    tmp = path + ".tmp"
+    try:
+        with open(path) as src, open(tmp, "w") as dst:
+            first = True
+            for line in src:
+                if first:
+                    dst.write(line)  # header
+                    first = False
+                    continue
+                ts = line.split(",", 1)[0]
+                if ts >= cutoff:
+                    dst.write(line)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def prune_watcher_log(path: str, retention_days: int) -> None:
+    """The watcher log has lines like '[YYYY-MM-DD HH:MM:SS] ...'."""
+    if not os.path.exists(path):
+        return
+    cutoff = (datetime.datetime.now() - datetime.timedelta(days=retention_days)).strftime("%Y-%m-%d")
+    tmp = path + ".tmp"
+    try:
+        with open(path) as src, open(tmp, "w") as dst:
+            for line in src:
+                m = re.match(r"\[(\d{4}-\d{2}-\d{2})", line)
+                if not m or m.group(1) >= cutoff:
+                    dst.write(line)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def main() -> int:
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    new_file = not os.path.exists(LOG)
+
+    app = get_frontmost_app()
+    window = get_window_title(app) if app else ""
+    idle = get_idle_sec()
+    tab_title = ""
+    tab_url = ""
+    if app and any(b in app for b in ("Chrome", "Brave", "Edge", "Vivaldi")):
+        tab_title, tab_url = get_browser_active_tab(app)
+
+    row = {
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+        "app": app,
+        "window_title": window,
+        "idle_sec": idle,
+        "browser_tab": tab_title,
+        "browser_url": tab_url,
+    }
+
+    with open(LOG, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=FIELDS, quoting=csv.QUOTE_MINIMAL)
+        if new_file:
+            w.writeheader()
+        w.writerow(row)
+
+    # Prune once per hour (when minute == 0) — cheap and bounded
+    if datetime.datetime.now().minute == 0:
+        prune_csv(LOG, RETENTION_DAYS)
+        prune_watcher_log(WATCHER_LOG, RETENTION_DAYS)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

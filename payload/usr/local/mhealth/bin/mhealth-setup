@@ -1,0 +1,84 @@
+#!/bin/bash
+# mhealth-setup — per-user setup for the mhealth ecosystem.
+# Run as the logged-in user (NOT root). Generates LaunchAgents for $HOME
+# and loads them into the user's launchd domain.
+#
+# Invoked automatically by the .pkg postinstall, and re-runnable any time
+# (e.g. after editing scripts in /usr/local/mhealth/bin/).
+
+set -eu
+
+if [ "$(id -u)" = "0" ]; then
+  echo "ERROR: mhealth-setup must run as your user, not root." >&2
+  echo "       Run:  /usr/local/bin/mhealth-setup" >&2
+  exit 1
+fi
+
+TEMPLATE_DIR=/usr/local/mhealth/templates
+LAUNCH_DIR="$HOME/Library/LaunchAgents"
+UID_NUM="$(id -u)"
+
+mkdir -p "$LAUNCH_DIR"
+mkdir -p "$HOME/Library/Logs"
+mkdir -p "$HOME/Library/Application Support/mac-health-watcher"
+
+for job in watcher activity server; do
+  src="$TEMPLATE_DIR/com.mhealth.${job}.plist"
+  dst="$LAUNCH_DIR/com.mhealth.${job}.plist"
+
+  if [ ! -f "$src" ]; then
+    echo "WARN: template missing: $src — skipping $job" >&2
+    continue
+  fi
+
+  # Unload any prior version (bootout is the modern equivalent of unload)
+  launchctl bootout "gui/${UID_NUM}" "$dst" 2>/dev/null || true
+
+  # Render the template — only __HOME__ needs substituting
+  sed "s|__HOME__|${HOME}|g" "$src" > "$dst"
+
+  # Load into the current GUI session
+  if ! launchctl bootstrap "gui/${UID_NUM}" "$dst" 2>/dev/null; then
+    # Fallback for older macOS or unusual sessions
+    launchctl load "$dst" 2>/dev/null || true
+  fi
+done
+
+# Best-effort: detect terminal-notifier and warn if missing
+TN_FOUND=""
+for cand in /opt/homebrew/bin/terminal-notifier /usr/local/bin/terminal-notifier; do
+  [ -x "$cand" ] && TN_FOUND="$cand" && break
+done
+
+cat <<EOF
+
+✓ mhealth installed for $(whoami)
+
+  Dashboard:    http://127.0.0.1:8765/
+  Commands:     mhealth, mhealth-kill, mhealth-uninstall
+  Logs:         ~/Library/Logs/mac-health-watcher.log
+                ~/Library/Logs/mhealth-activity.csv
+
+EOF
+
+if [ -z "$TN_FOUND" ]; then
+  cat <<EOF
+⚠ terminal-notifier is not installed.
+  Health alerts will fall back to osascript (less reliable).
+  To enable rich notifications:
+      brew install terminal-notifier
+
+EOF
+fi
+
+cat <<EOF
+⚠ macOS will request these permissions the first time data is collected:
+   • Screen Recording  (for window titles in the activity log)
+   • Automation / Apple Events → Chrome / Brave  (for browser tab access)
+   • Accessibility     (for frontmost-window queries)
+
+  Grant them in:  System Settings → Privacy & Security
+  Without them, the tools still work but some columns will be blank.
+
+Open the dashboard now?    open http://127.0.0.1:8765/
+EOF

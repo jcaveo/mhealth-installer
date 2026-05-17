@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>mhealth</title>
+<style>
+  body { font: 13px/1.5 -apple-system, BlinkMacSystemFont, sans-serif; padding: 20px 24px; color: #1d1d1f; }
+  h2 { font-size: 17px; margin: 0 0 12px; }
+  h3 { font-size: 13px; margin: 18px 0 6px; color: #444; }
+  ul { padding-left: 22px; margin: 6px 0; }
+  li { margin: 2px 0; }
+  code { background: #f4f4f4; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+</style></head>
+<body>
+<h2>mhealth — Mac health &amp; activity dashboard</h2>
+<p>This installs four background tools that watch system health, log activity,
+and serve a local dashboard at <code>http://127.0.0.1:8765/</code>.</p>
+
+<h3>What gets installed</h3>
+<ul>
+  <li><code>/usr/local/mhealth/</code> — scripts &amp; plist templates</li>
+  <li><code>/usr/local/bin/mhealth*</code> — command-line symlinks</li>
+  <li><code>~/Library/LaunchAgents/com.mhealth.*</code> — your user's LaunchAgents (3 jobs)</li>
+</ul>
+
+<h3>Permissions you'll need to grant</h3>
+<p>After install, macOS will ask for these the first time each one is needed.
+You can grant or skip — the tools work either way, but some columns will be blank:</p>
+<ul>
+  <li><b>Screen Recording</b> → window titles in the activity log</li>
+  <li><b>Automation → Chrome / Brave</b> → browser tab list</li>
+  <li><b>Accessibility</b> → frontmost-window detection</li>
+</ul>
+
+<h3>To uninstall</h3>
+<p>Run <code>mhealth-uninstall</code> in Terminal.</p>
+</body></html>

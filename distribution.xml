@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>mhealth</title>
+    <organization>com.mhealth</organization>
+    <welcome    file="welcome.html"    mime-type="text/html"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+    <options customize="never" require-scripts="true" rootVolumeOnly="true"/>
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="12.0"/>
+        </allowed-os-versions>
+    </volume-check>
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.mhealth.tools"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="com.mhealth.tools" visible="false">
+        <pkg-ref id="com.mhealth.tools"/>
+    </choice>
+    <pkg-ref id="com.mhealth.tools" version="1.0.0" onConclusion="none">mhealth-tools.pkg</pkg-ref>
+</installer-gui-script>

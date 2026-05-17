@@ -1,0 +1,4005 @@
+#!/usr/bin/python3
+"""
+mhealth-kill — local web UI for killing processes + closing Chrome tabs.
+
+Spawns a tiny HTTP server on a random port, opens it in the default browser.
+Sortable table, multi-select, Kill button, plus a Chrome tab list with Close
+buttons. Renderer→tab mapping uses JS-heap correlation (best-effort) when
+Chrome's "Allow JavaScript from Apple Events" is enabled.
+
+Server self-terminates 60 s after the browser tab is closed (or 10 min idle).
+"""
+from __future__ import annotations
+
+import http.server
+import json
+import os
+import random
+import re
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import datetime
+import webbrowser
+from typing import Any
+
+# --- Process classification -----------------------------------------------
+# level: "critical" = NEVER kill (will break system or session)
+#        "risky"    = kill is recoverable but disruptive (respawn/reload)
+#        "safe"     = killing only affects that app
+
+PROCESS_INFO: dict[str, tuple[str, str]] = {
+    # CRITICAL — kill blocked by UI and server
+    "WindowServer":     ("macOS UI compositor — kill = instant logout", "critical"),
+    "loginwindow":      ("Login session manager — kill = logout", "critical"),
+    "launchd":          ("System init / process supervisor", "critical"),
+    "kernel_task":      ("macOS kernel itself", "critical"),
+    "coreaudiod":       ("Audio system daemon", "critical"),
+    "cfprefsd":         ("Preferences (defaults) daemon", "critical"),
+    "secd":             ("Security / keychain daemon", "critical"),
+    "securityd":        ("Security framework daemon", "critical"),
+    "trustd":           ("Certificate trust evaluator", "critical"),
+    "notifyd":          ("Notification dispatcher", "critical"),
+    "powerd":           ("Power management", "critical"),
+    "bluetoothd":       ("Bluetooth daemon", "critical"),
+    "airportd":         ("Wi-Fi management", "critical"),
+    "fseventsd":        ("Filesystem events", "critical"),
+    "opendirectoryd":   ("Directory services / user accounts", "critical"),
+    "configd":          ("Network configuration daemon", "critical"),
+    "syslogd":          ("System logger", "critical"),
+    "launchservicesd":  ("Launch Services daemon", "critical"),
+    "diskarbitrationd": ("Disk mount/unmount handler", "critical"),
+    "logd":             ("Unified log daemon", "critical"),
+    "lsd":              ("Launch Services / app registry", "critical"),
+
+    # RISKY — will respawn but disruptive (UI flicker, reindex, etc.)
+    "Dock":              ("macOS Dock (will respawn — windows reorder)", "risky"),
+    "Finder":            ("Finder (will respawn — open windows close)", "risky"),
+    "SystemUIServer":    ("Menu bar (will respawn)", "risky"),
+    "Spotlight":         ("Spotlight UI", "risky"),
+    "ControlCenter":     ("Control Center (will respawn)", "risky"),
+    "NotificationCenter": ("Notification Center (will respawn)", "risky"),
+    "TextInputMenuAgent": ("Input source menu", "risky"),
+    "mds":               ("Spotlight metadata server (will respawn — re-index)", "risky"),
+    "mds_stores":        ("Spotlight database (will respawn)", "risky"),
+    "XprotectService":   ("macOS malware scanner — will respawn", "risky"),
+    "tccd":              ("Privacy / TCC permissions daemon", "risky"),
+    "rapportd":          ("Continuity / Handoff", "risky"),
+    "sharingd":          ("AirDrop / sharing", "risky"),
+
+    # SAFE — your apps and harmless background tasks
+    "Google Chrome":                  ("Chrome browser process", "safe"),
+    "Brave Browser":                  ("Brave browser process", "safe"),
+    "Brave Browser Helper":           ("Brave helper process", "safe"),
+    "Brave Browser Helper (Renderer)": ("Brave tab content (one or more tabs share this)", "safe"),
+    "Brave Browser Helper (GPU)":     ("Brave GPU process", "safe"),
+    "Slack":                          ("Slack messaging app", "safe"),
+    "Slack Helper (Renderer)": ("Slack content renderer (one per workspace/window)", "safe"),
+    "Slack Helper (GPU)":      ("Slack GPU process", "safe"),
+    "Slack Helper":            ("Slack helper process", "safe"),
+    "claude":                  ("Claude Code CLI session (terminal)", "safe"),
+    "Claude":                  ("Claude Desktop app", "safe"),
+    "Telegram":                ("Telegram messenger", "safe"),
+    "Surfshark":               ("Surfshark VPN client", "safe"),
+    "Wispr Flow":              ("Wispr Flow voice/text app", "safe"),
+    "Grammarly Desktop":       ("Grammarly", "safe"),
+    "Code Helper (Renderer)":  ("VS Code content process", "safe"),
+    "Code Helper":             ("VS Code helper", "safe"),
+    "Code":                    ("VS Code editor", "safe"),
+    "Cursor":                  ("Cursor editor", "safe"),
+    "Cursor Helper (Renderer)": ("Cursor content process", "safe"),
+    "Docker":                  ("Docker Desktop", "safe"),
+    "com.docker.backend":      ("Docker backend", "safe"),
+    "Spotify":                 ("Spotify music app", "safe"),
+    "Safari":                  ("Safari browser", "safe"),
+    "mdworker":                ("Spotlight indexer worker (will respawn)", "safe"),
+    "mdworker_shared":         ("Spotlight indexer worker (will respawn)", "safe"),
+    "spotlightknowledged":     ("Spotlight ML/knowledge indexer", "safe"),
+    "MTLCompilerService":      ("Metal shader compiler (will respawn)", "safe"),
+    "Python":                  ("Python interpreter (script process)", "safe"),
+    "node":                    ("Node.js process", "safe"),
+    "ssh":                     ("SSH client connection", "safe"),
+    "git":                     ("git command in progress", "safe"),
+    "ruby":                    ("Ruby interpreter", "safe"),
+    "java":                    ("Java process", "safe"),
+}
+
+CHROME_TYPE_INFO: dict[str, tuple[str, str]] = {
+    "browser":     ("Browser main process — kill closes the entire browser", "risky"),
+    "renderer":    ("Browser tab content (one or more tabs share this)", "safe"),
+    "gpu-process": ("Browser GPU compositor (will respawn)", "safe"),
+    "utility":     ("Browser utility worker (network/audio/storage)", "safe"),
+    "extension":   ("Browser extension background process", "safe"),
+    "network":     ("Browser network service — kills active downloads/streams", "risky"),
+}
+
+# Browsers we know how to query via AppleScript. Add more here.
+KNOWN_BROWSERS: list[dict[str, str]] = [
+    {"name": "Google Chrome", "app": "Google Chrome", "short": "Chrome",
+     "match": "Google Chrome", "color": "#4285F4"},
+    {"name": "Brave Browser", "app": "Brave Browser", "short": "Brave",
+     "match": "Brave Browser", "color": "#FB542B"},
+]
+
+
+def classify(name: str, ctype: str) -> tuple[str, str]:
+    """Return (description, level) for a process."""
+    if ctype and ctype in CHROME_TYPE_INFO:
+        return CHROME_TYPE_INFO[ctype]
+    if name in PROCESS_INFO:
+        return PROCESS_INFO[name]
+    # Heuristic catches
+    if name.endswith("d") and name.islower() and len(name) > 3:
+        # daemons — usually risky to kill
+        return (f"{name} (system daemon — uncertain impact)", "risky")
+    if "Helper" in name or "Renderer" in name:
+        return ("Application helper process", "safe")
+    return ("", "safe")
+
+
+# --- Process collection ---------------------------------------------------
+
+def get_processes(min_ram_mb: int = 20, top_n: int = 80) -> list[dict]:
+    out = subprocess.run(
+        ["ps", "-Aceo", "pid,rss,pcpu,comm", "-m"],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+
+    # Single ps call to get all command lines, build pid -> cmdline map.
+    # This replaces N subprocess calls (one per Chrome process) with one.
+    cmdlines: dict[int, str] = {}
+    try:
+        cmd_out = subprocess.run(
+            ["ps", "-Aww", "-o", "pid=,command="],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+        for line in cmd_out.splitlines():
+            line = line.strip()
+            sp = line.find(" ")
+            if sp <= 0:
+                continue
+            try:
+                cmdlines[int(line[:sp])] = line[sp + 1:]
+            except ValueError:
+                pass
+    except Exception:
+        pass
+
+    procs: list[dict] = []
+    for line in out[1:top_n + 1]:
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[0])
+            rss_kb = int(parts[1])
+            cpu = float(parts[2])
+            name = parts[3].strip()
+        except ValueError:
+            continue
+        rss_mb = rss_kb // 1024
+        if rss_mb < min_ram_mb:
+            continue
+
+        ptype = ""
+        ext_id = ""
+        browser = ""
+        # Detect any Chromium-based browser by process name
+        if ("Chrome" in name or name.startswith("Google") or
+                "Brave" in name or "Microsoft Edge" in name or
+                "Vivaldi" in name or "Opera" in name):
+            cmd = cmdlines.get(pid, "")
+            m = re.search(r"--type=([a-zA-Z-]+)", cmd)
+            ptype = m.group(1) if m else "browser"
+            if "--extension-process" in cmd:
+                ptype = "extension"
+                eid = re.search(r"--extension-id=([a-z0-9]+)", cmd)
+                if eid:
+                    ext_id = eid.group(1)
+            # Normalize the display name to its canonical browser name
+            if "Brave" in name:
+                name = "Brave Browser"
+                browser = "Brave"
+            elif "Microsoft Edge" in name:
+                name = "Microsoft Edge"
+                browser = "Edge"
+            elif "Vivaldi" in name:
+                name = "Vivaldi"
+                browser = "Vivaldi"
+            else:
+                name = "Google Chrome"
+                browser = "Chrome"
+
+        desc, level = classify(name, ptype)
+        proc = {"pid": pid, "ram": rss_mb, "cpu": cpu, "name": name,
+                "type": ptype, "browser": browser, "hint": "",
+                "desc": desc, "level": level}
+        if ext_id:
+            proc["hint"] = f"extension:{ext_id[:8]}"
+        if pid == 1:
+            proc["level"] = "critical"
+        procs.append(proc)
+    procs.sort(key=lambda p: p["ram"], reverse=True)
+
+    # Per-browser renderer → tab correlation using cached heap data.
+    # Match heaviest heap to heaviest RSS, within each browser.
+    try:
+        with _CACHE_LOCK:
+            tabs = list(_TAB_CACHE.get("tabs", []))
+        for b_short in {"Chrome", "Brave", "Edge", "Vivaldi"}:
+            renderers = sorted(
+                [p for p in procs if p.get("browser") == b_short
+                 and p["type"] == "renderer" and not p["hint"]],
+                key=lambda p: p["ram"], reverse=True,
+            )
+            t_for_b = sorted(
+                [t for t in tabs if t.get("browser") == b_short and t.get("heap", 0) > 0],
+                key=lambda t: t["heap"], reverse=True,
+            )
+            for renderer, tab in zip(renderers, t_for_b):
+                renderer["hint"] = f"~ {tab['title'][:50]}"
+    except Exception:
+        pass
+
+    return procs
+
+
+def _tabs_script(app_name: str, with_heap: bool) -> str:
+    if with_heap:
+        return (
+            f'tell application "{app_name}"\n'
+            'set out to ""\n'
+            'set wn to 0\n'
+            'repeat with w in windows\n'
+            'set wn to wn + 1\n'
+            'set tn to 0\n'
+            'repeat with t in tabs of w\n'
+            'set tn to tn + 1\n'
+            'try\n'
+            'set theTitle to title of t\n'
+            'set theURL to URL of t\n'
+            'set theHeap to "0"\n'
+            'try\n'
+            'set theHeap to (execute t javascript "(performance.memory && performance.memory.usedJSHeapSize) || 0") as text\n'
+            'end try\n'
+            'set out to out & wn & "|" & tn & "|" & theHeap & "|" & theTitle & "|" & theURL & linefeed\n'
+            'end try\n'
+            'end repeat\n'
+            'end repeat\n'
+            'return out\n'
+            'end tell\n'
+        )
+    return (
+        f'tell application "{app_name}"\n'
+        'set out to ""\n'
+        'set wn to 0\n'
+        'repeat with w in windows\n'
+        'set wn to wn + 1\n'
+        'set tn to 0\n'
+        'repeat with t in tabs of w\n'
+        'set tn to tn + 1\n'
+        'try\n'
+        'set out to out & wn & "|" & tn & "|0|" & (title of t) & "|" & (URL of t) & linefeed\n'
+        'end try\n'
+        'end repeat\n'
+        'end repeat\n'
+        'return out\n'
+        'end tell\n'
+    )
+
+
+def get_browser_tabs(with_heap: bool = False) -> list[dict]:
+    """Aggregate tabs from all known running browsers.
+    Each tab dict has: browser (short name), window, tab, title, url, heap."""
+    all_tabs: list[dict] = []
+    for b in KNOWN_BROWSERS:
+        if subprocess.run(["pgrep", "-x", b["app"]], capture_output=True).returncode != 0:
+            continue
+        try:
+            script = _tabs_script(b["app"], with_heap)
+            timeout = 180 if with_heap else 8
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            for line in result.stdout.splitlines():
+                parts = line.split("|", 4)
+                if len(parts) >= 5:
+                    try:
+                        all_tabs.append({
+                            "browser": b["short"],
+                            "browser_app": b["app"],
+                            "window": int(parts[0]),
+                            "tab": int(parts[1]),
+                            "heap": int(parts[2]) if parts[2].isdigit() else 0,
+                            "title": parts[3],
+                            "url": parts[4],
+                        })
+                    except ValueError:
+                        pass
+        except Exception:
+            continue
+    return all_tabs
+
+
+def close_browser_tab(app_name: str, window: int, tab: int) -> bool:
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'tell application "{app_name}" to close tab {tab} of window {window}'],
+            capture_output=True, timeout=5, check=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def focus_browser_tab(app_name: str, window: int, tab: int) -> bool:
+    """Activate a specific tab + bring its window to front."""
+    script = (
+        f'tell application "{app_name}"\n'
+        '  activate\n'
+        f'  set active tab index of window {window} to {tab}\n'
+        f'  set index of window {window} to 1\n'
+        'end tell\n'
+    )
+    try:
+        subprocess.run(["osascript", "-e", script],
+                       capture_output=True, timeout=5, check=True)
+        return True
+    except Exception:
+        return False
+
+
+# --- Disk cleanup ---------------------------------------------------------
+
+# Whitelist of paths we'll scan + offer to clean. Each entry:
+#   path: shell path (~/ ok), category (label), action (delete-contents/empty-trash/docker-prune),
+#   level (safe/risky), desc (one-liner explanation).
+DISK_CANDIDATES: list[dict] = [
+    {"path": "~/.Trash", "category": "Trash", "action": "empty-trash", "risk": "safe",
+     "desc": "Files in Trash.",
+     "what_breaks": "Nothing — these are already in your Trash.",
+     "regen": "Permanent delete; not recoverable."},
+    {"path": "~/Library/Caches", "category": "App Caches", "action": "scan-children", "risk": "safe",
+     "desc": "Per-app cache directory.",
+     "what_breaks": "Apps may load slowly on first launch after deletion; some may briefly forget UI state.",
+     "regen": "Apps rebuild on next use (seconds to minutes)."},
+    {"path": "~/Library/Logs", "category": "App Logs", "action": "scan-children", "risk": "safe",
+     "desc": "App log files.",
+     "what_breaks": "You lose historical logs (debugging value only).",
+     "regen": "Apps write new logs as they run."},
+    {"path": "~/Library/Developer/Xcode/DerivedData", "category": "Xcode",
+     "action": "delete-contents", "risk": "safe",
+     "desc": "Xcode build cache + intermediate compile artifacts.",
+     "what_breaks": "Next Xcode compile takes longer (full rebuild instead of incremental).",
+     "regen": "Full rebuild on next Xcode compile (minutes per project)."},
+    {"path": "~/Library/Containers/com.docker.docker/Data/vms", "category": "Docker VM",
+     "action": "docker-prune", "risk": "danger",
+     "desc": "Docker virtual disk — contains ALL Docker state, not just cache.",
+     "what_breaks": "Raw deletion wipes images + containers + NAMED VOLUMES (postgres/redis/mysql data may be in there). Use 'Run docker prune' instead.",
+     "regen": "Images: re-pull from registries (slow). Volumes: gone forever unless backed up. 'docker system prune' only removes unused stuff and keeps named volumes."},
+    {"path": "~/.npm", "category": "npm cache", "action": "delete-contents", "risk": "safe",
+     "desc": "npm package cache.",
+     "what_breaks": "Next 'npm install' is slower — packages re-downloaded from npm registry.",
+     "regen": "1-2 minutes per project on next install (depending on dep count + network)."},
+    {"path": "~/Library/pnpm/store", "category": "pnpm store", "action": "delete-contents", "risk": "safe",
+     "desc": "pnpm content-addressable package store.",
+     "what_breaks": "Next 'pnpm install' redownloads all dependencies for projects you've touched.",
+     "regen": "Re-downloaded on next install (slower than npm because pnpm fetches each package once)."},
+    {"path": "~/Library/Caches/pip", "category": "pip cache", "action": "delete-contents", "risk": "safe",
+     "desc": "Python pip wheel cache.",
+     "what_breaks": "Next 'pip install' downloads + builds wheels again.",
+     "regen": "Seconds to minutes per package on next install."},
+    {"path": "~/Library/Caches/ms-playwright", "category": "Playwright", "action": "delete-contents", "risk": "caution",
+     "desc": "Playwright browser binaries (Chromium / Firefox / WebKit for testing).",
+     "what_breaks": "Playwright tests will FAIL until you run 'npx playwright install' again.",
+     "regen": "'npx playwright install' downloads ~500-800 MB; takes 1-3 min."},
+    {"path": "~/Library/Caches/Homebrew", "category": "Homebrew", "action": "delete-contents", "risk": "safe",
+     "desc": "Homebrew bottle downloads (compiled binaries it has fetched).",
+     "what_breaks": "Next 'brew install' / 'brew upgrade' re-downloads bottles.",
+     "regen": "Per-package re-download on next install (seconds-minutes)."},
+    {"path": "~/Library/Caches/Yarn", "category": "Yarn cache", "action": "delete-contents", "risk": "safe",
+     "desc": "Yarn package cache.",
+     "what_breaks": "Next 'yarn install' redownloads packages.",
+     "regen": "1-2 minutes per project."},
+    {"path": "~/Library/Caches/Google/Chrome", "category": "Chrome cache", "action": "delete-contents", "risk": "caution",
+     "desc": "Chrome's HTTP cache (separate from history/bookmarks/passwords).",
+     "what_breaks": "First load of every website is slower; some sites may briefly show stale UI. Best to QUIT Chrome before deleting.",
+     "regen": "Rebuilds automatically as you browse."},
+]
+
+
+def _safe_path(p: str) -> str:
+    return os.path.expanduser(p)
+
+
+def _du_mb(path: str, timeout: int = 30) -> int:
+    if not os.path.exists(path):
+        return -1
+    try:
+        out = subprocess.run(
+            ["du", "-sk", path],
+            capture_output=True, text=True, timeout=timeout,
+        ).stdout
+        return int(out.split()[0]) // 1024
+    except Exception:
+        return -1
+
+
+def scan_disk() -> list[dict]:
+    """Returns a list of candidate items. May take 5-30 seconds — caller caches."""
+    items: list[dict] = []
+    for cand in DISK_CANDIDATES:
+        path = _safe_path(cand["path"])
+        if cand["action"] == "scan-children":
+            # List subdirs and report each one over 50 MB
+            if not os.path.isdir(path):
+                continue
+            try:
+                children = os.listdir(path)
+            except PermissionError:
+                continue
+            for child in children:
+                child_path = os.path.join(path, child)
+                if not os.path.isdir(child_path):
+                    continue
+                size_mb = _du_mb(child_path, timeout=10)
+                if size_mb >= 50:
+                    items.append({
+                        "path": child_path,
+                        "size_mb": size_mb,
+                        "category": cand["category"],
+                        "risk": cand.get("risk", "safe"),
+                        "level": cand.get("risk", "safe"),  # back-compat
+                        "action": "delete-contents",
+                        "desc": cand["desc"] + f" ({child})",
+                        "what_breaks": cand.get("what_breaks", ""),
+                        "regen": cand.get("regen", ""),
+                    })
+        else:
+            size_mb = _du_mb(path, timeout=20)
+            if size_mb < 0:
+                continue
+            if size_mb < 10:
+                continue
+            items.append({
+                "path": path,
+                "size_mb": size_mb,
+                "category": cand["category"],
+                "risk": cand.get("risk", "safe"),
+                "level": cand.get("risk", "safe"),  # back-compat
+                "action": cand["action"],
+                "desc": cand["desc"],
+                "what_breaks": cand.get("what_breaks", ""),
+                "regen": cand.get("regen", ""),
+            })
+    items.sort(key=lambda x: x["size_mb"], reverse=True)
+
+    # Disk volume info for header
+    total_gb = used_gb = avail_gb = 0
+    pct = "?"
+    try:
+        df_out = subprocess.run(
+            ["df", "-k", "/System/Volumes/Data"],
+            capture_output=True, text=True,
+        ).stdout.splitlines()[1].split()
+        total_gb = int(df_out[1]) // 1024 // 1024
+        used_gb = int(df_out[2]) // 1024 // 1024
+        avail_gb = int(df_out[3]) // 1024 // 1024
+        pct = df_out[4]
+    except Exception:
+        pass
+    return [{"_meta": {"total_gb": total_gb, "used_gb": used_gb,
+                       "avail_gb": avail_gb, "pct": pct}}] + items
+
+
+# --- Read Later storage --------------------------------------------------
+
+READLATER_DIR = os.path.expanduser("~/Library/Application Support/mac-health-watcher")
+READLATER_PATH = os.path.join(READLATER_DIR, "read-later.json")
+_READLATER_LOCK = threading.Lock()
+
+
+def _readlater_load() -> list[dict]:
+    if not os.path.exists(READLATER_PATH):
+        return []
+    try:
+        with open(READLATER_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _readlater_save(items: list[dict]) -> None:
+    os.makedirs(READLATER_DIR, exist_ok=True)
+    tmp = READLATER_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(items, f, indent=2)
+    os.replace(tmp, READLATER_PATH)
+
+
+def readlater_add(items: list[dict]) -> int:
+    """Append items, dedupe by URL. Returns number of new entries added."""
+    with _READLATER_LOCK:
+        existing = _readlater_load()
+        existing_urls = {e.get("url") for e in existing}
+        added = 0
+        now = datetime.datetime.now().isoformat(timespec="seconds")
+        for it in items:
+            url = (it.get("url") or "").strip()
+            if not url or url in existing_urls:
+                continue
+            entry = {
+                "id": str(int(time.time() * 1000)) + "-" + str(added),
+                "url": url,
+                "title": (it.get("title") or "").strip()[:300],
+                "browser": (it.get("browser") or "").strip(),
+                "saved_at": now,
+            }
+            existing.insert(0, entry)
+            existing_urls.add(url)
+            added += 1
+        _readlater_save(existing)
+        return added
+
+
+def readlater_remove(item_id: str) -> bool:
+    with _READLATER_LOCK:
+        existing = _readlater_load()
+        new = [e for e in existing if e.get("id") != item_id]
+        if len(new) == len(existing):
+            return False
+        _readlater_save(new)
+        return True
+
+
+# --- Projects tracker (Claude-built work) --------------------------------
+
+PROJECTS_PATH = os.path.join(READLATER_DIR, "projects.json")
+_PROJECTS_LOCK = threading.Lock()
+VALID_STATES = {"in_progress", "finished", "unfinished"}
+
+# Seeded only when projects.json doesn't exist yet. After that, the user
+# owns the list entirely — re-running the tool never overwrites their data.
+_SEED_PROJECTS = [
+    {
+        "name": "mhealth ecosystem",
+        "description": "Mac health watcher + dashboard + activity logger + Read Later + Disk Cleanup + this Projects tab. Distributed as a signed-or-unsigned .pkg.",
+        "state": "in_progress",
+        "path": "~/Documents/projects/mhealth-installer",
+        "pending": "Apple Developer ID signing + notarization; migrate user's own Mac from com.jc.* to com.mhealth.* LaunchAgents.",
+    },
+    {
+        "name": "session-auto-rename",
+        "description": "Auto-renames Claude Code resume sessions to readable 'Project: Task' strings via a Stop hook. Has a recursion guard (CLAUDE_SKIP_RENAME_HOOK).",
+        "state": "finished",
+        "path": "~/.claude/scripts/rename-session.py",
+        "pending": "",
+    },
+]
+
+
+def _projects_load() -> list[dict]:
+    if not os.path.exists(PROJECTS_PATH):
+        return []
+    try:
+        with open(PROJECTS_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _projects_save(items: list[dict]) -> None:
+    os.makedirs(READLATER_DIR, exist_ok=True)
+    tmp = PROJECTS_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(items, f, indent=2)
+    os.replace(tmp, PROJECTS_PATH)
+
+
+def _projects_ensure_seeded() -> list[dict]:
+    """First-run: write seed entries. Subsequent runs: leave the file alone."""
+    if os.path.exists(PROJECTS_PATH):
+        return _projects_load()
+    now = datetime.datetime.now().strftime("%Y-%m-%d")
+    seeded = []
+    for i, p in enumerate(_SEED_PROJECTS):
+        seeded.append({
+            "id": str(int(time.time() * 1000)) + "-" + str(i),
+            "name": p["name"],
+            "description": p["description"],
+            "state": p["state"],
+            "path": p["path"],
+            "pending": p["pending"],
+            "last_work_date": now,
+            "created_at": now,
+        })
+    _projects_save(seeded)
+    return seeded
+
+
+def _normalize_project(raw: dict, existing: dict | None = None) -> dict:
+    """Validate + clean a project dict. existing is the prior version (for updates)."""
+    state = (raw.get("state") or "in_progress").strip()
+    if state not in VALID_STATES:
+        state = "in_progress"
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    date = (raw.get("last_work_date") or "").strip()
+    if not date:
+        date = today
+    return {
+        "id": (existing or {}).get("id") or (str(int(time.time() * 1000)) + "-" + str(random.randint(0, 9999))),
+        "name": (raw.get("name") or "").strip()[:120],
+        "description": (raw.get("description") or "").strip()[:500],
+        "state": state,
+        "path": (raw.get("path") or "").strip()[:500],
+        "pending": (raw.get("pending") or "").strip()[:500],
+        "last_work_date": date[:10],
+        "created_at": (existing or {}).get("created_at") or today,
+    }
+
+
+def projects_add(raw: dict) -> dict:
+    with _PROJECTS_LOCK:
+        items = _projects_load()
+        entry = _normalize_project(raw)
+        if not entry["name"]:
+            raise ValueError("name is required")
+        items.insert(0, entry)
+        _projects_save(items)
+        return entry
+
+
+def projects_update(item_id: str, raw: dict) -> dict | None:
+    with _PROJECTS_LOCK:
+        items = _projects_load()
+        for i, e in enumerate(items):
+            if e.get("id") == item_id:
+                merged = {**e, **raw}
+                items[i] = _normalize_project(merged, existing=e)
+                _projects_save(items)
+                return items[i]
+        return None
+
+
+def projects_remove(item_id: str) -> bool:
+    with _PROJECTS_LOCK:
+        items = _projects_load()
+        new = [e for e in items if e.get("id") != item_id]
+        if len(new) == len(items):
+            return False
+        _projects_save(new)
+        return True
+
+
+# --- Cloud Archive (rclone wrapper + folder classifier + registry) ------
+
+ARCHIVES_PATH = os.path.join(READLATER_DIR, "archives.json")
+_ARCHIVES_LOCK = threading.Lock()
+ARCHIVE_REMOTE_PREFIX = "mhealth-archive"  # all archives live under <remote>:mhealth-archive/<id>/
+
+# Top-level dirs/files that are regenerable (npm install / docker pull / etc.)
+REGENERABLE_DIRS = {
+    "node_modules", "dist", "build", ".next", "target", ".venv", "venv",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".gradle", ".cache",
+    "out", ".turbo", ".parcel-cache", "DerivedData", ".dart_tool",
+    "Pods", ".bundle", ".sass-cache", "vendor",  # vendor varies; PHP/Go projects regenerate it
+}
+# Extensions where a single large file is worth archiving rather than keeping local
+ARCHIVE_EXTENSIONS = {
+    ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".mp4", ".mov", ".mkv", ".avi", ".webm",
+    ".zip", ".tar", ".gz", ".tgz", ".7z", ".rar", ".bz2",
+    ".csv", ".parquet", ".sqlite", ".db", ".dmg", ".iso", ".pkg",
+    ".psd", ".ai", ".sketch", ".fig", ".afdesign", ".afphoto",
+    ".bin", ".pth", ".onnx", ".gguf", ".safetensors",  # ML weights
+}
+# Tiny config/source files — always KEEP
+KEEP_PATTERNS = {
+    ".git", ".gitignore", ".gitattributes", ".env.example", "Dockerfile",
+    "docker-compose.yml", "package.json", "package-lock.json", "pnpm-lock.yaml",
+    "yarn.lock", "requirements.txt", "pyproject.toml", "tsconfig.json",
+    "Makefile", "README.md", "LICENSE", "CHANGELOG.md", "DECISIONS.md",
+}
+SOURCE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".rb", ".php",
+    ".java", ".kt", ".swift", ".c", ".cpp", ".h", ".hpp", ".html", ".css",
+    ".scss", ".vue", ".svelte", ".md", ".txt", ".yml", ".yaml", ".json",
+    ".toml", ".sh", ".bash", ".zsh", ".sql", ".lua", ".dart",
+}
+
+
+def _du_bytes(path: str, max_seconds: float = 8.0) -> int:
+    """Walk a path and sum file sizes. Bounded by wall time to avoid hangs."""
+    deadline = time.time() + max_seconds
+    total = 0
+    try:
+        if os.path.isfile(path):
+            return os.path.getsize(path)
+        for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+            if time.time() > deadline:
+                break
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                try:
+                    st = os.lstat(fp)
+                    if (st.st_mode & 0o170000) == 0o100000:  # regular file
+                        total += st.st_size
+                except OSError:
+                    continue
+    except Exception:
+        pass
+    return total
+
+
+def classify_folder(target: str) -> dict:
+    """Walk top-level entries of `target` and classify each."""
+    target = os.path.expanduser(target)
+    if not os.path.isdir(target):
+        return {"ok": False, "error": "not a directory"}
+
+    items = []
+    home = os.path.expanduser("~")
+    # Refuse to scan outside $HOME
+    if not (target == home or target.startswith(home + os.sep)):
+        return {"ok": False, "error": "path must be under $HOME"}
+
+    try:
+        entries = sorted(os.listdir(target))
+    except PermissionError as e:
+        # On macOS, scanning ~/Documents / ~/Desktop / ~/Downloads under launchd
+        # often hits TCC (Transparency, Consent & Control). The server's Python
+        # interpreter needs explicit consent in System Settings.
+        hint = ""
+        protected = ("/Documents/", "/Desktop/", "/Downloads/")
+        if any(p in target + "/" for p in protected):
+            hint = (" — macOS likely blocking access via privacy controls. "
+                    "Grant 'Files and Folders' (or 'Full Disk Access') to the "
+                    "Python interpreter at System Settings → Privacy & Security.")
+        return {"ok": False, "error": f"permission denied{hint} ({e.strerror or e})"}
+
+    for name in entries:
+        full = os.path.join(target, name)
+        try:
+            st = os.lstat(full)
+        except OSError:
+            continue
+        is_link = os.path.islink(full)
+        is_dir = (not is_link) and os.path.isdir(full)
+        ext = os.path.splitext(name)[1].lower()
+        # Pre-compute size once (for files: stat; for dirs: walk-bounded; for links: 0)
+        if is_link:
+            size_bytes = 0
+        elif is_dir:
+            size_bytes = _du_bytes(full, max_seconds=4.0)
+        else:
+            size_bytes = st.st_size
+
+        # Classify
+        category = "keep"
+        reason = "leave alone by default"
+
+        if is_link:
+            reason = "symlink — leave alone"
+        elif is_dir and name in REGENERABLE_DIRS:
+            category = "delete"
+            reason = f"'{name}' is regenerable (npm install / docker pull / build)"
+        elif name in KEEP_PATTERNS:
+            reason = "project metadata / configuration"
+        elif not is_dir and ext in SOURCE_EXTENSIONS:
+            reason = "source code"
+        elif not is_dir and ext in ARCHIVE_EXTENSIONS:
+            if size_bytes >= 10 * 1024 * 1024:
+                category = "archive"
+                reason = f"large {ext} asset, non-regenerable"
+            else:
+                reason = "small asset, not worth archiving"
+        elif is_dir:
+            if os.path.isdir(os.path.join(full, ".git")):
+                category = "check"
+                reason = "git repo — check for uncommitted/unpushed work before archiving"
+            elif size_bytes >= 100 * 1024 * 1024:
+                category = "archive"
+                reason = f"large folder ({_fmt_bytes(size_bytes)}), no .git inside"
+            else:
+                reason = "small folder, not worth archiving"
+
+        items.append({
+            "name": name,
+            "path": full,
+            "is_dir": is_dir,
+            "size_bytes": size_bytes,
+            "category": category,
+            "reason": reason,
+        })
+
+    # Aggregate
+    totals = {"delete": 0, "archive": 0, "keep": 0, "check": 0}
+    for it in items:
+        totals[it["category"]] = totals.get(it["category"], 0) + it["size_bytes"]
+
+    return {
+        "ok": True,
+        "target": target,
+        "items": items,
+        "totals_bytes": totals,
+    }
+
+
+def _fmt_bytes(n: int) -> str:
+    if n < 1024: return f"{n} B"
+    if n < 1024 ** 2: return f"{n/1024:.1f} KB"
+    if n < 1024 ** 3: return f"{n/1024**2:.1f} MB"
+    return f"{n/1024**3:.2f} GB"
+
+
+# --- rclone wrapper ------------------------------------------------------
+
+def _which_rclone() -> str | None:
+    for p in (
+        "/opt/homebrew/bin/rclone", "/usr/local/bin/rclone",
+        "/opt/local/bin/rclone", "/usr/bin/rclone",
+    ):
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    # PATH fallback
+    try:
+        r = subprocess.run(["which", "rclone"], capture_output=True, text=True, timeout=2)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def rclone_available() -> bool:
+    return _which_rclone() is not None
+
+
+def rclone_remotes() -> list[dict]:
+    """List configured remotes with type. Free/used pulled on demand via rclone_about()."""
+    exe = _which_rclone()
+    if not exe:
+        return []
+    try:
+        r = subprocess.run([exe, "listremotes", "--long"], capture_output=True, text=True, timeout=5)
+        out = r.stdout.strip()
+    except Exception:
+        return []
+    remotes = []
+    for line in out.splitlines():
+        # Format: "name: type"
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        name_part, _, type_part = line.partition(":")
+        # rclone listremotes --long returns "name: type" where name has no trailing colon
+        remotes.append({"name": name_part.strip(), "type": type_part.strip()})
+    return remotes
+
+
+def rclone_about(remote: str) -> dict:
+    """Returns {total, used, free} in bytes, or {} if unavailable for that backend."""
+    exe = _which_rclone()
+    if not exe:
+        return {}
+    try:
+        r = subprocess.run(
+            [exe, "about", f"{remote}:", "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode != 0:
+            return {}
+        return json.loads(r.stdout) if r.stdout.strip() else {}
+    except Exception:
+        return {}
+
+
+def rclone_run(args: list[str], timeout: int = 3600) -> tuple[int, str, str]:
+    exe = _which_rclone()
+    if not exe:
+        return (127, "", "rclone not installed")
+    try:
+        r = subprocess.run([exe] + args, capture_output=True, text=True, timeout=timeout)
+        return (r.returncode, r.stdout, r.stderr)
+    except subprocess.TimeoutExpired:
+        return (124, "", f"timeout after {timeout}s")
+    except Exception as e:
+        return (1, "", str(e))
+
+
+# --- Archive registry ----------------------------------------------------
+
+def _archives_load() -> list[dict]:
+    if not os.path.exists(ARCHIVES_PATH):
+        return []
+    try:
+        with open(ARCHIVES_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _archives_save(items: list[dict]) -> None:
+    os.makedirs(READLATER_DIR, exist_ok=True)
+    tmp = ARCHIVES_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(items, f, indent=2)
+    os.replace(tmp, ARCHIVES_PATH)
+
+
+def archives_add(entry: dict) -> dict:
+    with _ARCHIVES_LOCK:
+        items = _archives_load()
+        items.insert(0, entry)
+        _archives_save(items)
+        return entry
+
+
+def archives_remove(entry_id: str) -> dict | None:
+    with _ARCHIVES_LOCK:
+        items = _archives_load()
+        for i, e in enumerate(items):
+            if e.get("id") == entry_id:
+                removed = items.pop(i)
+                _archives_save(items)
+                return removed
+        return None
+
+
+def archive_path_to_cloud(local_path: str, remote: str) -> dict:
+    """Atomic: rclone copy → rclone check → record → rm local. Returns result dict."""
+    local_path = os.path.expanduser(local_path)
+    home = os.path.expanduser("~")
+    if not (local_path.startswith(home + os.sep) or local_path == home):
+        return {"ok": False, "error": "path must be under $HOME"}
+    if not os.path.exists(local_path):
+        return {"ok": False, "error": "path does not exist"}
+    if not rclone_available():
+        return {"ok": False, "error": "rclone not installed"}
+    remotes = {r["name"] for r in rclone_remotes()}
+    if remote not in remotes:
+        return {"ok": False, "error": f"remote '{remote}' not configured"}
+
+    entry_id = f"{int(time.time()*1000)}-{random.randint(0, 9999)}"
+    base = os.path.basename(local_path.rstrip("/")) or "root"
+    remote_path = f"{ARCHIVE_REMOTE_PREFIX}/{entry_id}-{base}"
+    target = f"{remote}:{remote_path}"
+    size_before = _du_bytes(local_path, max_seconds=30.0)
+
+    # 1. Copy
+    rc, _, err = rclone_run(["copy", local_path, target, "--transfers", "4", "--checkers", "8"])
+    if rc != 0:
+        return {"ok": False, "error": f"rclone copy failed: {err[:300]}", "stage": "copy"}
+
+    # 2. Verify with one-way check (every local file must exist on remote with matching hash/size)
+    rc, _, err = rclone_run(["check", local_path, target, "--one-way"])
+    if rc != 0:
+        # Don't delete local — clean up the partial upload
+        rclone_run(["purge", target], timeout=300)
+        return {"ok": False, "error": f"rclone check failed (upload incomplete): {err[:300]}", "stage": "check"}
+
+    # 3. Record
+    entry = {
+        "id": entry_id,
+        "original_path": local_path,
+        "name": base,
+        "remote": remote,
+        "remote_path": remote_path,
+        "size_bytes": size_before,
+        "archived_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "is_dir": os.path.isdir(local_path),
+    }
+    archives_add(entry)
+
+    # 4. Delete local — only after registry is updated
+    try:
+        if os.path.isdir(local_path) and not os.path.islink(local_path):
+            import shutil
+            shutil.rmtree(local_path)
+        else:
+            os.remove(local_path)
+    except Exception as e:
+        # Cloud copy is verified + registered — local delete failed but archive is safe.
+        return {"ok": True, "warning": f"archived OK but local delete failed: {e}", "entry": entry}
+
+    return {"ok": True, "entry": entry}
+
+
+def restore_archive(entry_id: str, *, keep_remote: bool = True) -> dict:
+    """Download from cloud back to original_path. Refuses to overwrite existing files."""
+    if not rclone_available():
+        return {"ok": False, "error": "rclone not installed"}
+    items = _archives_load()
+    entry = next((e for e in items if e.get("id") == entry_id), None)
+    if not entry:
+        return {"ok": False, "error": "archive not found"}
+
+    local_path = entry["original_path"]
+    if os.path.exists(local_path):
+        return {"ok": False, "error": f"refusing to overwrite — {local_path} already exists"}
+
+    src = f"{entry['remote']}:{entry['remote_path']}"
+    # rclone copy src dst where dst is the destination directory.
+    # For a folder archive, we want the contents under local_path itself.
+    os.makedirs(local_path, exist_ok=True) if entry.get("is_dir") else os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    dst = local_path if entry.get("is_dir") else os.path.dirname(local_path)
+    rc, _, err = rclone_run(["copy", src, dst, "--transfers", "4"])
+    if rc != 0:
+        return {"ok": False, "error": f"rclone copy failed: {err[:300]}"}
+
+    # If file archive (not dir), the file should now be at the right place
+    if not keep_remote:
+        rclone_run(["purge", src], timeout=300)
+        archives_remove(entry_id)
+
+    return {"ok": True, "entry": entry, "kept_remote": keep_remote}
+
+
+def delete_archive(entry_id: str) -> dict:
+    """Remove from cloud + remove registry entry. Does not touch any local file."""
+    if not rclone_available():
+        return {"ok": False, "error": "rclone not installed"}
+    items = _archives_load()
+    entry = next((e for e in items if e.get("id") == entry_id), None)
+    if not entry:
+        return {"ok": False, "error": "archive not found"}
+    src = f"{entry['remote']}:{entry['remote_path']}"
+    rc, _, err = rclone_run(["purge", src], timeout=300)
+    # Even if purge fails (e.g. remote already gone), drop the registry entry on user's call.
+    archives_remove(entry_id)
+    return {"ok": rc == 0, "purge_error": err[:300] if rc != 0 else None}
+
+
+# --- Time-spent analysis -------------------------------------------------
+
+ACTIVITY_LOG = os.path.expanduser("~/Library/Logs/mhealth-activity.csv")
+IDLE_THRESHOLD_SEC = 60  # rows where idle_sec >= this don't count as "active"
+
+
+def _parse_activity_rows(since: datetime.datetime, until: datetime.datetime) -> list[dict]:
+    if not os.path.exists(ACTIVITY_LOG):
+        return []
+    import csv as _csv
+    rows: list[dict] = []
+    try:
+        with open(ACTIVITY_LOG, newline="") as f:
+            for r in _csv.DictReader(f):
+                ts_str = r.get("timestamp", "")
+                if not ts_str:
+                    continue
+                try:
+                    ts = datetime.datetime.fromisoformat(ts_str)
+                except ValueError:
+                    continue
+                if since <= ts <= until:
+                    rows.append({
+                        "ts": ts, "app": r.get("app", ""),
+                        "window": r.get("window_title", ""),
+                        "idle": int(r.get("idle_sec") or 0),
+                        "browser_tab": r.get("browser_tab", ""),
+                        "browser_url": r.get("browser_url", ""),
+                    })
+    except Exception:
+        pass
+    return rows
+
+
+def _aggregate_app_time(rows: list[dict]) -> tuple[list[dict], int, int]:
+    """Returns (top_apps, active_minutes, total_minutes).
+    Each entry: 1 minute (each row is one tick). Idle rows excluded from active."""
+    from collections import Counter
+    active = Counter()
+    total = 0
+    active_total = 0
+    for r in rows:
+        total += 1
+        if r["idle"] < IDLE_THRESHOLD_SEC and r["app"]:
+            active[r["app"]] += 1
+            active_total += 1
+    out = [{"app": a, "minutes": m, "pct": round(100 * m / max(1, active_total))}
+           for a, m in active.most_common(15)]
+    return out, active_total, total
+
+
+def _browser_history_top_sites(since_unix: int, top: int = 20) -> list[dict]:
+    """Aggregate visits across ALL Chrome + Brave profiles."""
+    from collections import Counter
+    import glob
+    import shutil
+    import sqlite3
+    import tempfile
+    from urllib.parse import urlparse
+
+    counter: Counter = Counter()
+    # Chrome timestamps: microseconds since 1601-01-01
+    epoch_offset_us = 11644473600 * 1_000_000
+    cutoff_us = since_unix * 1_000_000 + epoch_offset_us
+
+    roots = [
+        ("Chrome", os.path.expanduser("~/Library/Application Support/Google/Chrome")),
+        ("Brave",  os.path.expanduser("~/Library/Application Support/BraveSoftware/Brave-Browser")),
+    ]
+    db_paths: list[tuple[str, str]] = []
+    for name, root in roots:
+        if not os.path.isdir(root):
+            continue
+        # Each profile is a subdir with a History sqlite db. Skip Guest Profile.
+        for db in glob.glob(os.path.join(root, "*", "History")):
+            if "Guest Profile" in db:
+                continue
+            db_paths.append((name, db))
+
+    for name, db in db_paths:
+        try:
+            tmp = tempfile.mktemp(suffix=".db")
+            shutil.copy(db, tmp)
+            with sqlite3.connect(tmp) as conn:
+                # Count REAL visits in the time window via the visits table
+                rows = conn.execute(
+                    "SELECT u.url, COUNT(v.visit_time) AS n "
+                    "FROM urls u JOIN visits v ON v.url = u.id "
+                    "WHERE v.visit_time > ? "
+                    "GROUP BY u.url ORDER BY n DESC LIMIT 500",
+                    (cutoff_us,),
+                ).fetchall()
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            for url, n in rows:
+                try:
+                    host = (urlparse(url).hostname or url).lower()
+                except Exception:
+                    host = url.lower()
+                if not host or host in ("127.0.0.1", "localhost"):
+                    continue
+                # Strip leading www. so foo.com and www.foo.com merge
+                if host.startswith("www."):
+                    host = host[4:]
+                counter[(host, name)] += n
+        except Exception:
+            continue
+
+    return [{"host": h, "browser": b, "visits": c}
+            for (h, b), c in counter.most_common(top)]
+
+
+def _shell_history_top(since_unix: int, top: int = 20) -> list[dict]:
+    """Parse zsh extended-history format `: <ts>:<dur>;<cmd>`."""
+    from collections import Counter
+    path = os.path.expanduser("~/.zsh_history")
+    if not os.path.exists(path):
+        return []
+    counter: Counter = Counter()
+    try:
+        with open(path, "rb") as f:
+            for raw in f:
+                try:
+                    line = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    line = raw.decode("latin-1", errors="replace")
+                m = re.match(r"^: (\d+):\d+;(.+)$", line)
+                if not m:
+                    continue
+                ts = int(m.group(1))
+                if ts < since_unix:
+                    continue
+                cmd = m.group(2).strip()
+                # First word as the command bucket
+                first = cmd.split()[0] if cmd else ""
+                if first:
+                    counter[first] += 1
+    except Exception:
+        pass
+    return [{"command": c, "count": n} for c, n in counter.most_common(top)]
+
+
+def time_spent_summary(range_key: str) -> dict:
+    now = datetime.datetime.now()
+    if range_key == "today":
+        since = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif range_key == "yesterday":
+        y = now - datetime.timedelta(days=1)
+        since = y.replace(hour=0, minute=0, second=0, microsecond=0)
+        now = y.replace(hour=23, minute=59, second=59)
+    elif range_key == "7days":
+        since = now - datetime.timedelta(days=7)
+    elif range_key == "30days":
+        since = now - datetime.timedelta(days=30)
+    else:
+        since = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    rows = _parse_activity_rows(since, now)
+    apps, active_min, total_min = _aggregate_app_time(rows)
+    sites = _browser_history_top_sites(int(since.timestamp()))
+    cmds = _shell_history_top(int(since.timestamp()))
+    activity_log_exists = os.path.exists(ACTIVITY_LOG)
+    return {
+        "range": range_key,
+        "since": since.isoformat(),
+        "active_minutes": active_min,
+        "total_minutes": total_min,
+        "idle_minutes": total_min - active_min,
+        "apps": apps,
+        "top_sites": sites,
+        "top_commands": cmds,
+        "activity_log_exists": activity_log_exists,
+        "rows_collected": len(rows),
+    }
+
+
+def clean_path(path: str, action: str) -> tuple[bool, str]:
+    """Returns (success, message). Validates path is in the whitelist."""
+    expanded = os.path.realpath(_safe_path(path))
+    home = os.path.expanduser("~")
+    # Defense: must live under $HOME, must match a whitelisted root
+    if not expanded.startswith(home + os.sep):
+        return False, "path is not under user home"
+    whitelist_roots = [_safe_path(c["path"]) for c in DISK_CANDIDATES]
+    whitelist_real = [os.path.realpath(p) for p in whitelist_roots if os.path.exists(p)]
+    if not any(expanded == r or expanded.startswith(r + os.sep) for r in whitelist_real):
+        return False, "path is not on the cleanup whitelist"
+    if not os.path.exists(expanded):
+        return False, "path does not exist"
+
+    try:
+        if action == "empty-trash":
+            # Walk Trash and remove everything inside
+            for entry in os.listdir(expanded):
+                full = os.path.join(expanded, entry)
+                if os.path.isdir(full):
+                    subprocess.run(["rm", "-rf", full], check=False, timeout=120)
+                else:
+                    try:
+                        os.remove(full)
+                    except Exception:
+                        pass
+            return True, "emptied"
+        elif action == "delete-contents":
+            # Delete the directory contents (keep the directory itself)
+            for entry in os.listdir(expanded):
+                full = os.path.join(expanded, entry)
+                subprocess.run(["rm", "-rf", full], check=False, timeout=120)
+            return True, "cleaned"
+        else:
+            return False, f"action {action} not supported"
+    except Exception as e:
+        return False, str(e)
+
+
+def docker_prune(deep: bool = False) -> dict:
+    """Run `docker system prune` safely. Never -a --volumes (that wipes named volumes).
+    deep=True adds -a (removes UNUSED images too, but still keeps named volumes).
+    """
+    # Try common docker locations (Docker Desktop puts it in /usr/local/bin)
+    docker = None
+    for cand in ("/usr/local/bin/docker", "/opt/homebrew/bin/docker"):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            docker = cand
+            break
+    if not docker:
+        try:
+            r = subprocess.run(["which", "docker"], capture_output=True, text=True, timeout=2)
+            if r.returncode == 0 and r.stdout.strip():
+                docker = r.stdout.strip()
+        except Exception:
+            pass
+    if not docker:
+        return {"ok": False, "error": "docker CLI not found on PATH"}
+
+    args = [docker, "system", "prune", "-f"]
+    if deep:
+        args.append("-a")
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=300)
+        return {
+            "ok": r.returncode == 0,
+            "stdout": r.stdout[-2000:],
+            "stderr": r.stderr[-2000:],
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "docker prune timed out after 5 minutes"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def pick_folder() -> dict:
+    """Pop the macOS folder picker via AppleScript. Returns selected POSIX path or None."""
+    script = (
+        'set f to choose folder with prompt "Pick a folder to scan with mhealth"\n'
+        'return POSIX path of f'
+    )
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode != 0:
+            # User cancelled (returncode 1) is the common path
+            return {"ok": False, "cancelled": "User canceled." in (r.stderr or "")}
+        path = r.stdout.strip()
+        # Strip trailing slash for consistency with how scan handles paths
+        if path.endswith("/") and len(path) > 1:
+            path = path[:-1]
+        return {"ok": True, "path": path}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "picker timed out"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def scan_home_overview() -> dict:
+    """Quick overview of top-level $HOME directories with size. Helps locate scan targets fast."""
+    home = os.path.expanduser("~")
+    skip = {"Library", "Applications", ".Trash"}  # noisy / not useful as scan targets
+    items = []
+    try:
+        for name in sorted(os.listdir(home)):
+            if name.startswith(".") and name not in {".config", ".cache", ".local"}:
+                continue
+            if name in skip:
+                continue
+            full = os.path.join(home, name)
+            try:
+                st = os.lstat(full)
+            except OSError:
+                continue
+            is_link = os.path.islink(full)
+            is_dir = (not is_link) and os.path.isdir(full)
+            if is_link:
+                continue
+            if is_dir:
+                size = _du_bytes(full, max_seconds=10.0)
+            else:
+                size = st.st_size
+            items.append({"name": name, "path": full, "is_dir": is_dir, "size_bytes": size})
+    except PermissionError:
+        return {"ok": False, "error": "permission denied scanning $HOME"}
+    items.sort(key=lambda x: x["size_bytes"], reverse=True)
+    return {"ok": True, "home": home, "items": items}
+
+
+# --- Notification snooze --------------------------------------------------
+
+SNOOZE_FILE = os.path.join(READLATER_DIR, "snoozed-until")
+
+
+def snooze_status() -> dict:
+    """Returns {snoozed: bool, until: epoch|None, remaining_seconds: int}"""
+    if not os.path.exists(SNOOZE_FILE):
+        return {"snoozed": False, "until": None, "remaining_seconds": 0}
+    try:
+        with open(SNOOZE_FILE) as f:
+            until = int(f.read().strip())
+    except Exception:
+        return {"snoozed": False, "until": None, "remaining_seconds": 0}
+    now = int(time.time())
+    remaining = until - now
+    return {"snoozed": remaining > 0, "until": until, "remaining_seconds": max(0, remaining)}
+
+
+def snooze_set(seconds: int) -> dict:
+    """Set snooze. seconds<=0 cancels."""
+    os.makedirs(READLATER_DIR, exist_ok=True)
+    if seconds <= 0:
+        try:
+            if os.path.exists(SNOOZE_FILE):
+                os.remove(SNOOZE_FILE)
+        except Exception:
+            pass
+        return snooze_status()
+    until = int(time.time()) + int(seconds)
+    tmp = SNOOZE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(until))
+    os.replace(tmp, SNOOZE_FILE)
+    return snooze_status()
+
+
+def system_summary() -> dict:
+    s: dict[str, Any] = {}
+    try:
+        load = subprocess.run(["uptime"], capture_output=True, text=True).stdout
+        s["load"] = re.search(r"load averages?:\s*([\d.]+)", load).group(1)
+    except Exception:
+        s["load"] = "?"
+    try:
+        vm = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+        free_pages = int(re.search(r"Pages free:\s+(\d+)", vm).group(1))
+        comp_pages = int(re.search(r"Pages occupied by compressor:\s+(\d+)", vm).group(1))
+        s["free_mb"] = free_pages * 16384 // 1024 // 1024
+        s["comp_mb"] = comp_pages * 16384 // 1024 // 1024
+    except Exception:
+        s["free_mb"] = s["comp_mb"] = 0
+    try:
+        swap_line = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True).stdout
+        s["swap_mb"] = int(float(re.search(r"used\s*=\s*([\d.]+)M", swap_line).group(1)))
+    except Exception:
+        s["swap_mb"] = 0
+    try:
+        df_out = subprocess.run(["df", "-h", "/System/Volumes/Data"], capture_output=True, text=True).stdout
+        s["disk_pct"] = df_out.splitlines()[1].split()[4]
+        s["disk_avail"] = df_out.splitlines()[1].split()[3]
+    except Exception:
+        s["disk_pct"] = "?"
+        s["disk_avail"] = "?"
+    return s
+
+
+# --- HTML ---------------------------------------------------------------
+
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Mac Health — Kill Processes</title>
+<style>
+  :root {
+    --bg: #f5f5f7; --card: #ffffff; --text: #1d1d1f; --muted: #6e6e73;
+    --line: #d2d2d7; --accent: #0071e3; --danger: #ff3b30;
+    --warn: #ff9500; --ok: #34c759; --row-hover: #f5f5f7;
+    --row-sel: #e7f3ff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #1d1d1f; --card: #2c2c2e; --text: #f5f5f7; --muted: #a1a1a6;
+            --line: #3a3a3c; --row-hover: #3a3a3c; --row-sel: #003566; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 13px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui;
+         background: var(--bg); color: var(--text); padding: 16px; max-width: 1800px; }
+  h2 { margin: 18px 0 8px; font-size: 14px; font-weight: 600; color: var(--muted); }
+  /* Side-by-side: Processes left (wider), Browser Tabs right.
+     Stacks to single column on narrower screens. */
+  .layout { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
+            gap: 18px; align-items: start; }
+  .layout > section { min-width: 0; }
+  .layout > section > h2:first-child { margin-top: 0; }
+  @media (max-width: 1200px) { .layout { grid-template-columns: 1fr; } }
+  .tabs { display: flex; gap: 4px; margin-bottom: 12px; border-bottom: 1px solid var(--line); }
+  .tab { padding: 8px 16px; border: 1px solid transparent; border-bottom: none;
+         border-radius: 8px 8px 0 0; cursor: pointer; color: var(--muted); user-select: none;
+         font-weight: 500; }
+  .tab.active { background: var(--card); border-color: var(--line); color: var(--text);
+                margin-bottom: -1px; }
+  .tab:hover:not(.active) { color: var(--text); background: var(--row-hover); }
+  .pane { display: none; }
+  .pane.active { display: block; }
+  .disk-summary { display: flex; gap: 24px; align-items: center; padding: 16px;
+                  background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+                  margin-bottom: 12px; }
+  .disk-bar { flex: 1; height: 12px; background: var(--bg); border-radius: 6px; overflow: hidden;
+              border: 1px solid var(--line); }
+  .disk-bar-fill { height: 100%; background: linear-gradient(to right, var(--ok), var(--warn), var(--danger)); }
+  .summary { display: flex; flex-wrap: wrap; gap: 8px 18px; padding: 12px 16px;
+             background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+             margin-bottom: 12px; font-size: 13px; }
+  .summary .item { display: flex; gap: 6px; align-items: baseline; }
+  .summary .item .lbl { color: var(--muted); }
+  .summary .item .val { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .summary .item.alert .val { color: var(--danger); }
+  .summary .item.warn .val { color: var(--warn); }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+  .toolbar > .status { margin-left: auto; }
+  /* Tables clip overflow so long titles get ellipsised, not blow out the layout */
+  table { table-layout: fixed; }
+  td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td.wrap { white-space: normal; }
+  /* The "title" cell in browser tabs has its title + url stacked */
+  .tab-title-cell { white-space: normal; }
+  .tab-title-cell .title { font-weight: 500; overflow: hidden; text-overflow: ellipsis;
+                          display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line);
+           background: var(--card); color: var(--text); cursor: pointer; }
+  button:hover { background: var(--row-hover); }
+  button.primary { background: var(--accent); color: white; border-color: var(--accent); }
+  button.primary:hover { filter: brightness(1.1); }
+  button.danger { background: var(--danger); color: white; border-color: var(--danger); }
+  button.danger:hover { filter: brightness(1.1); }
+  button.tiny { padding: 2px 8px; font-size: 12px; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  label { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); }
+  .status { margin-left: auto; color: var(--muted); font-size: 12px; }
+  .status.ok { color: var(--ok); }
+  .status.err { color: var(--danger); }
+
+  table { width: 100%; border-collapse: collapse; background: var(--card);
+          border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+          font-variant-numeric: tabular-nums; }
+  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--line); }
+  th { background: var(--bg); font-weight: 600; cursor: pointer; user-select: none;
+       position: sticky; top: 0; z-index: 1; font-size: 12px; color: var(--muted); }
+  th:hover { color: var(--text); }
+  th.sorted { color: var(--text); }
+  td.num, th.num { text-align: right; }
+  tr:hover td { background: var(--row-hover); }
+  tr.selected td { background: var(--row-sel); }
+  tr:last-child td { border-bottom: none; }
+  .ram-bar { display: inline-block; height: 4px; border-radius: 2px;
+             background: var(--accent); vertical-align: middle; margin-right: 6px; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px;
+           background: var(--bg); color: var(--muted); border: 1px solid var(--line); }
+  .badge.renderer { background: #e7f3ff; color: #0071e3; border-color: #b3d9ff; }
+  .badge.gpu-process { background: #f3e8ff; color: #8e44ad; border-color: #d9b3ff; }
+  .badge.browser { background: #fff4e5; color: #ff9500; border-color: #ffd9b3; }
+  .badge.utility, .badge.network { background: #e8f5e9; color: #34c759; border-color: #b3e6c2; }
+  .badge.extension { background: #fce4ec; color: #c2185b; border-color: #f8bbd0; }
+  .browser-tag { display: inline-flex; align-items: center; gap: 4px; padding: 1px 8px;
+                 border-radius: 10px; font-size: 11px; font-weight: 600;
+                 background: var(--bg); color: var(--muted); border: 1px solid var(--line); }
+  .browser-tag.Chrome { background: #e8f0fe; color: #1a73e8; border-color: #aecbfa; }
+  .browser-tag.Brave  { background: #ffeae0; color: #fb542b; border-color: #ffc7ad; }
+  .browser-tag.Edge   { background: #e3f2fd; color: #0078d4; border-color: #b3d9f7; }
+  .browser-tag.Vivaldi { background: #ffe5e5; color: #ef3939; border-color: #ffb3b3; }
+  .browser-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .browser-dot.Chrome { background: #4285F4; }
+  .browser-dot.Brave  { background: #FB542B; }
+  .browser-dot.Edge   { background: #0078D4; }
+  .browser-dot.Vivaldi { background: #EF3939; }
+  @media (prefers-color-scheme: dark) {
+    .badge.renderer { background: #003566; color: #6cb4ff; border-color: #004080; }
+    .badge.gpu-process { background: #4a1d6b; color: #c9a4ff; border-color: #5b2580; }
+    .badge.browser { background: #5a3500; color: #ffb74d; border-color: #6b4000; }
+    .badge.utility, .badge.network { background: #1b4d22; color: #7be08e; border-color: #235c2c; }
+    .badge.extension { background: #5b1d3d; color: #ff8ab1; border-color: #6e2549; }
+    .browser-tag.Chrome { background: #1a3a6e; color: #8ab4f8; border-color: #2c4d80; }
+    .browser-tag.Brave  { background: #5a2a18; color: #ff9270; border-color: #7a3a25; }
+  }
+  .col-cb { width: 28px; }
+  .col-tab { width: 36px; color: var(--muted); }
+  /* Column resize handles */
+  th { position: relative; }
+  .col-resizer { position: absolute; top: 0; right: -3px; bottom: 0; width: 6px;
+                 cursor: col-resize; user-select: none; z-index: 2; }
+  .col-resizer:hover, .col-resizer.dragging { background: var(--accent); opacity: 0.5; }
+  body.col-resizing { cursor: col-resize; user-select: none; }
+  .pid { color: var(--muted); }
+  .killing { opacity: 0.4; transition: opacity 0.3s; }
+  .hint { color: var(--muted); font-size: 12px; font-style: italic; }
+  .url { color: var(--muted); font-size: 11px; }
+  tr.this-tab td { background: #fff8e1; }
+  @media (prefers-color-scheme: dark) { tr.this-tab td { background: #4a3c10; } }
+  .this-tab-badge { display: inline-block; padding: 1px 7px; border-radius: 10px;
+                    font-size: 10px; font-weight: 600; background: var(--accent); color: white;
+                    margin-left: 6px; vertical-align: middle; }
+  .dup-badge { display: inline-block; padding: 1px 7px; border-radius: 10px;
+               font-size: 11px; font-weight: 600; background: var(--warn); color: white; }
+  .dup-primary-badge { display: inline-block; padding: 1px 7px; border-radius: 10px;
+                       font-size: 11px; font-weight: 600; background: var(--bg); color: var(--muted);
+                       border: 1px solid var(--line); }
+  tr.is-dup td { background: rgba(255, 149, 0, 0.06); }
+  .desc { color: var(--muted); font-size: 12px; }
+  tr.critical td { background: #fff5f5; }
+  tr.critical td.warn-cell { color: var(--danger); font-weight: 600; }
+  tr.risky td.warn-cell { color: var(--warn); font-weight: 600; }
+  @media (prefers-color-scheme: dark) {
+    tr.critical td { background: #3a1f1f; }
+  }
+  .level-icon { font-size: 14px; }
+  .col-warn { width: 24px; text-align: center; }
+  .banner { background: #fff4e5; border: 1px solid #ffd9b3; color: #8a4400;
+            padding: 8px 12px; border-radius: 8px; font-size: 12px;
+            margin-bottom: 12px; display: flex; gap: 12px; align-items: center; }
+  @media (prefers-color-scheme: dark) {
+    .banner { background: #5a3500; border-color: #6b4000; color: #ffd9b3; }
+  }
+  .banner a { color: inherit; text-decoration: underline; cursor: pointer; }
+</style>
+</head>
+<body>
+  <!-- Top status bar with snooze widget (fixed, always visible) -->
+  <div style="position:fixed;top:8px;right:14px;z-index:100;display:flex;align-items:center;gap:8px;font-size:12px">
+    <span id="snoozeStatus" style="padding:4px 10px;border-radius:14px;background:#d1fae5;color:#065f46;font-weight:500;display:none">🔔 Alerts on</span>
+    <div style="position:relative" id="snoozeWrap">
+      <button onclick="toggleSnoozeMenu()" id="snoozeBtn" style="padding:4px 10px;border:1px solid var(--line);border-radius:14px;background:#fff;cursor:pointer;font-size:12px">Snooze ▾</button>
+      <div id="snoozeMenu" style="display:none;position:absolute;top:30px;right:0;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,0.15);min-width:180px;overflow:hidden">
+        <div class="snoozeItem" onclick="setSnooze(900)" style="padding:8px 14px;cursor:pointer;font-size:12px">15 minutes</div>
+        <div class="snoozeItem" onclick="setSnooze(3600)" style="padding:8px 14px;cursor:pointer;font-size:12px">1 hour</div>
+        <div class="snoozeItem" onclick="setSnooze(7200)" style="padding:8px 14px;cursor:pointer;font-size:12px">2 hours</div>
+        <div class="snoozeItem" onclick="setSnoozeTomorrow()" style="padding:8px 14px;cursor:pointer;font-size:12px">Until 9 AM tomorrow</div>
+        <div style="border-top:1px solid var(--line)"></div>
+        <div class="snoozeItem" onclick="setSnooze(0)" style="padding:8px 14px;cursor:pointer;font-size:12px;color:#0369a1">Resume alerts now</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="summary" id="summary"></div>
+
+  <div id="hintBanner" class="banner" style="display:none">
+    <span>💡 Tab→PID mapping is OFF for this browser. Enable View → Developer → "Allow JavaScript from Apple Events" for renderer hints.</span>
+    <a onclick="this.parentElement.style.display='none'">Dismiss</a>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" data-pane="tabs" onclick="switchTab('tabs')">Tabs</div>
+    <div class="tab" data-pane="processes" onclick="switchTab('processes')">Processes</div>
+    <div class="tab" data-pane="readlater" onclick="switchTab('readlater')">Read Later</div>
+    <div class="tab" data-pane="caches" onclick="switchTab('caches')">Caches</div>
+    <div class="tab" data-pane="archive" onclick="switchTab('archive')">Archive</div>
+    <div class="tab" data-pane="projects" onclick="switchTab('projects')">Projects</div>
+    <div class="tab" data-pane="time" onclick="switchTab('time')">Time Spent</div>
+    <div class="tab" data-pane="cloudsetup" onclick="switchTab('cloudsetup')">Cloud Setup</div>
+  </div>
+
+  <div id="pane-processes" class="pane">
+    <h2>Processes</h2>
+    <div class="toolbar">
+      <button class="danger" onclick="killSelected()">Kill Selected</button>
+      <button onclick="refresh()">Refresh</button>
+      <label><input type="checkbox" id="autoRefresh" onchange="toggleAuto()"> Auto-refresh (5 s)</label>
+      <label><input type="checkbox" id="confirm" checked> Confirm before kill</label>
+      <span class="status" id="status">Loading…</span>
+    </div>
+      <table id="procTable">
+        <colgroup>
+          <col style="width:32px">
+          <col style="width:24px">
+          <col style="width:110px">
+          <col style="width:64px">
+          <col style="width:220px">
+          <col><!-- "What it does" — fluid -->
+          <col style="width:100px">
+          <col style="width:280px">
+          <col style="width:72px">
+        </colgroup>
+        <thead>
+          <tr>
+            <th class="col-cb"><input type="checkbox" id="selAll" onchange="toggleAll()"></th>
+            <th class="col-warn"></th>
+            <th class="num" data-key="ram">RAM (MB) <span class="arrow">↓</span></th>
+            <th class="num" data-key="cpu">CPU % <span class="arrow"></span></th>
+            <th data-key="name">Process <span class="arrow"></span></th>
+            <th data-key="desc">What it does <span class="arrow"></span></th>
+            <th data-key="type">Type <span class="arrow"></span></th>
+            <th data-key="hint">Hint <span class="arrow"></span></th>
+            <th class="num" data-key="pid">PID <span class="arrow"></span></th>
+          </tr>
+        </thead>
+        <tbody id="procRows"></tbody>
+    </table>
+  </div>
+
+  <div id="pane-tabs" class="pane active">
+    <h2>Browser Tabs <span id="tabCount" style="color:var(--muted);font-weight:400">(0)</span>
+      <span style="font-weight:400;color:var(--muted);font-size:12px;margin-left:8px">
+        · Closing a tab cleanly frees its renderer (no "Aw, Snap!")
+      </span>
+    </h2>
+    <div class="toolbar">
+      <button onclick="closeSelectedTabs()">Close Selected</button>
+      <button onclick="closeAllDuplicates()" id="dupBtn" title="Close every duplicate tab, keeping the first occurrence of each URL">Close duplicates <span id="dupCount" style="opacity:0.7"></span></button>
+      <button onclick="saveAndCloseSelected()" title="Save selected tabs to Read Later AND close them — frees RAM now, URL preserved">Save &amp; Close Selected</button>
+      <button onclick="closeOtherMhealthTabs()" title="Close other 127.0.0.1 Mac Health tabs in any browser">Close stale Mac Health tabs</button>
+    </div>
+    <table id="tabTable">
+      <colgroup>
+        <col style="width:32px">
+        <col style="width:110px">
+        <col style="width:80px">
+        <col style="width:90px">
+        <col><!-- title fluid -->
+        <col style="width:100px">
+        <col style="width:230px">
+      </colgroup>
+      <thead>
+        <tr>
+          <th class="col-cb"><input type="checkbox" id="tabSelAll" onchange="toggleAllTabs()"></th>
+          <th data-key="browser">Browser</th>
+          <th class="col-tab">W/T</th>
+          <th>Status</th>
+          <th>Title / URL</th>
+          <th class="num" data-key="heap">Heap MB</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="tabRows"></tbody>
+    </table>
+  </div>
+
+  <div id="pane-readlater" class="pane">
+    <h2>Read Later <span id="rlCount" style="color:var(--muted);font-weight:400">(0)</span>
+      <span style="font-weight:400;color:var(--muted);font-size:12px;margin-left:8px">
+        · Tabs you saved for later. Stored locally at <code>~/Library/Application Support/mac-health-watcher/read-later.json</code>
+      </span>
+    </h2>
+    <div class="toolbar">
+      <button onclick="refreshReadLater()">Refresh</button>
+      <button onclick="exportReadLater()">Export JSON</button>
+      <span class="status" id="rlStatus"></span>
+    </div>
+    <table>
+      <colgroup>
+        <col style="width:140px">
+        <col style="width:110px">
+        <col><!-- fluid -->
+        <col style="width:240px">
+      </colgroup>
+      <thead>
+        <tr>
+          <th>Saved</th>
+          <th>Browser</th>
+          <th>Title / URL</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="rlRows"></tbody>
+    </table>
+  </div>
+
+  <div id="pane-caches" class="pane">
+    <h2 style="margin:0 0 6px;font-size:17px">Caches
+      <span style="font-weight:400;color:var(--muted);font-size:12px;margin-left:8px">
+        · System-managed regenerable junk — npm/Docker/Homebrew caches, Trash, build artifacts. Most are 🟢 safe; check each row's risk level before deleting.
+      </span>
+    </h2>
+    <div class="disk-summary" id="diskSummary">
+      <div>Loading disk info…</div>
+    </div>
+    <div class="toolbar">
+      <button class="danger" onclick="cleanSelectedDisk()">Clean Selected</button>
+      <button onclick="refreshDisk(true)">Rescan</button>
+      <span class="hint">Whitelisted paths only — caches, trash, build artifacts. Apps rebuild caches on next use.</span>
+      <span class="status" id="diskStatus"></span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th class="col-cb"><input type="checkbox" id="diskSelAll" onchange="toggleAllDisk()"></th>
+          <th class="col-warn"></th>
+          <th class="num" data-key="size_mb">Size <span class="arrow">↓</span></th>
+          <th data-key="category">Category</th>
+          <th>Path</th>
+          <th>What it is</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="diskRows"><tr><td colspan="7" style="text-align:center;color:var(--muted)">Click "Rescan" or wait — initial scan can take 30 s.</td></tr></tbody>
+    </table>
+  </div>
+
+  <div id="pane-archive" class="pane">
+    <h2 style="margin:0 0 6px;font-size:17px">Archive
+      <span style="font-weight:400;color:var(--muted);font-size:12px;margin-left:8px">
+        · Scan a folder → mhealth classifies items → delete regenerable, archive cold assets to cloud, keep source. Restore from cloud anytime.
+      </span>
+    </h2>
+
+    <!-- Compact banner when cloud isn't configured (full setup lives on Cloud Setup tab) -->
+    <div id="cloudSetupHint" style="display:none;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:10px 14px;margin:10px 0;font-size:13px;color:#92400e;display:flex;justify-content:space-between;align-items:center;gap:10px">
+      <span id="cloudSetupHintText">☁️ Cloud archive isn't configured yet. You can still delete regenerable items here, but archiving needs a remote.</span>
+      <button onclick="switchTab('cloudsetup')" style="background:#f97316;color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;flex-shrink:0">Set up cloud →</button>
+    </div>
+
+    <!-- Compact remotes summary on Space (shows when configured) -->
+    <div id="cloudRemotesCompact" style="display:none;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin:10px 0;font-size:12px;color:var(--muted)"></div>
+
+    <!-- Scanner + Archived items side-by-side -->
+    <div class="layout" style="grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 18px; align-items: start; margin-top:14px">
+      <section>
+        <h3 style="margin:0 0 8px;font-size:14px">Scan folder(s)</h3>
+        <div class="toolbar" style="margin-bottom:6px;flex-wrap:wrap">
+          <input id="scanPath" type="text" placeholder="~/Documents/projects/old-thing  (comma-separated for multiple)" style="flex:1;padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-family:ui-monospace,Menlo,monospace;font-size:12px;min-width:280px">
+          <button onclick="pickFolder()" title="Open macOS folder picker">📂 Browse…</button>
+          <button class="primary" onclick="scanFolder()" style="background:var(--accent);color:#fff;border-color:var(--accent)">Scan</button>
+        </div>
+        <div class="toolbar" style="margin-bottom:8px;flex-wrap:wrap;font-size:12px">
+          <span style="color:var(--muted)">Presets:</span>
+          <button class="tiny" onclick="scanHomeOverview()" title="Scan top-level $HOME directories">🏠 Scan home</button>
+          <button class="tiny" onclick="setScanPreset('~/Documents/projects')">~/Documents/projects</button>
+          <button class="tiny" onclick="setScanPreset('~/Desktop')">~/Desktop</button>
+          <button class="tiny" onclick="setScanPreset('~/Downloads')">~/Downloads</button>
+          <button class="tiny" onclick="setScanPreset('~/Movies')">~/Movies</button>
+          <span class="status" id="scanStatus" style="margin-left:auto"></span>
+        </div>
+        <div id="scanLegend" style="font-size:12px;color:var(--muted);margin-bottom:8px;display:none">
+          <span style="display:inline-block;margin-right:14px">🗑 <b>Delete</b> — regenerable</span>
+          <span style="display:inline-block;margin-right:14px">☁️ <b>Archive</b> — cold assets</span>
+          <span style="display:inline-block;margin-right:14px">⚠️ <b>Check</b> — git repos, untracked work risk</span>
+          <span style="display:inline-block">🔒 <b>Keep</b> — source / configs</span>
+        </div>
+        <div id="scanTotals" style="display:none;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:8px;font-size:13px"></div>
+        <div id="scanActions" style="display:none;margin-bottom:8px">
+          <button onclick="deleteRegenerableSelected()" class="danger">🗑 Delete selected</button>
+          <label style="margin-left:14px">Archive to
+            <select id="archiveRemote" style="padding:5px 8px;border:1px solid var(--line);border-radius:6px"></select>
+          </label>
+          <button onclick="archiveSelected()">☁️ Archive selected</button>
+        </div>
+        <table id="scanTable" style="display:none">
+          <colgroup>
+            <col style="width:32px"><col style="width:34px"><col><col style="width:90px"><col style="width:90px"><col><!-- reason --></colgroup>
+          <thead><tr>
+            <th><input type="checkbox" id="scanSelAll" onchange="toggleAllScan()"></th>
+            <th></th>
+            <th>Name</th>
+            <th class="num">Size</th>
+            <th>Category</th>
+            <th>Why</th>
+          </tr></thead>
+          <tbody id="scanRows"></tbody>
+        </table>
+      </section>
+
+      <section>
+        <h3 style="margin:0 0 8px;font-size:14px">Archived items <span style="font-weight:400;color:var(--muted);font-size:11px">(in cloud)</span></h3>
+        <div class="toolbar" style="margin-bottom:8px">
+          <button onclick="refreshCloud()">Refresh</button>
+          <span class="status" id="archStatus"></span>
+        </div>
+        <table id="archTable">
+          <colgroup><col><col style="width:90px"><col style="width:90px"><col style="width:200px"></colgroup>
+          <thead><tr><th>Original path</th><th>Remote</th><th class="num">Size</th><th></th></tr></thead>
+          <tbody id="archRows"><tr><td colspan="4" style="text-align:center;color:var(--muted);padding:20px">No archives yet.</td></tr></tbody>
+        </table>
+        <div style="margin-top:18px;padding:10px 14px;background:#f9fafb;border:1px solid var(--line);border-radius:8px;font-size:12px;color:var(--muted);line-height:1.55">
+          <b>What goes where:</b><br>
+          <b>🗑 Delete (regenerable):</b> <code>node_modules</code>, <code>dist</code>, <code>.next</code>, <code>target</code>, <code>.venv</code>, <code>__pycache__</code>. Re-create with <code>npm install</code> / build tools.<br>
+          <b>☁️ Archive (cold assets):</b> PDFs, videos, screenshots, datasets, ML weights, design files, finished deliverables. Non-regenerable.<br>
+          <b>⚠️ Check first (git repos):</b> Confirm no untracked files or unpushed commits before archiving.<br>
+          <b>🔒 Keep:</b> Source code, configs, small files.
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <div id="pane-projects" class="pane">
+    <h2>Projects <span id="projCount" style="color:var(--muted);font-weight:400">(0)</span>
+      <span style="font-weight:400;color:var(--muted);font-size:12px;margin-left:8px">
+        · Claude-built work. Stored at <code>~/Library/Application Support/mac-health-watcher/projects.json</code>
+      </span>
+    </h2>
+    <div class="toolbar">
+      <button onclick="openProjectModal()">+ Add project</button>
+      <button onclick="refreshProjects()">Refresh</button>
+      <label style="margin-left:14px">Filter
+        <select id="projFilter" onchange="renderProjects()">
+          <option value="all">All</option>
+          <option value="in_progress">In progress</option>
+          <option value="unfinished">Unfinished</option>
+          <option value="finished">Finished</option>
+        </select>
+      </label>
+      <span class="status" id="projStatus"></span>
+    </div>
+    <table id="projTable">
+      <colgroup>
+        <col style="width:160px">
+        <col><!-- description fluid -->
+        <col style="width:120px">
+        <col style="width:110px">
+        <col style="width:280px">
+        <col><!-- pending fluid -->
+        <col style="width:140px">
+      </colgroup>
+      <thead>
+        <tr>
+          <th>Project</th>
+          <th>Description</th>
+          <th>State</th>
+          <th>Last work</th>
+          <th>Path</th>
+          <th>Pending</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="projRows"></tbody>
+    </table>
+  </div>
+
+  <div id="projModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:9999;align-items:center;justify-content:center">
+    <div style="background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px 22px;width:560px;max-width:92%;box-shadow:0 12px 48px rgba(0,0,0,0.3)">
+      <h2 id="projModalTitle" style="margin:0 0 14px">Add project</h2>
+      <form id="projForm" onsubmit="saveProject(event)">
+        <input type="hidden" id="projId" value="">
+        <div style="display:grid;grid-template-columns:120px 1fr;gap:10px 12px;align-items:start">
+          <label style="padding-top:6px">Name *</label>
+          <input id="projName" type="text" required maxlength="120" autocomplete="off" style="padding:6px 8px;border:1px solid var(--line);border-radius:6px">
+
+          <label style="padding-top:6px">Description</label>
+          <textarea id="projDesc" rows="3" maxlength="500" style="padding:6px 8px;border:1px solid var(--line);border-radius:6px;resize:vertical"></textarea>
+
+          <label style="padding-top:6px">State</label>
+          <select id="projState" style="padding:6px 8px;border:1px solid var(--line);border-radius:6px">
+            <option value="in_progress">In progress</option>
+            <option value="unfinished">Unfinished</option>
+            <option value="finished">Finished</option>
+          </select>
+
+          <label style="padding-top:6px">Last work date</label>
+          <input id="projDate" type="date" style="padding:6px 8px;border:1px solid var(--line);border-radius:6px">
+
+          <label style="padding-top:6px">Path</label>
+          <input id="projPath" type="text" maxlength="500" placeholder="~/Documents/projects/example" style="padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-family:ui-monospace,Menlo,monospace;font-size:12px">
+
+          <label style="padding-top:6px">Pending tasks</label>
+          <textarea id="projPending" rows="2" maxlength="500" placeholder="Short notes, comma-separated" style="padding:6px 8px;border:1px solid var(--line);border-radius:6px;resize:vertical"></textarea>
+        </div>
+        <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
+          <button type="button" onclick="closeProjectModal()">Cancel</button>
+          <button type="submit" class="primary" style="background:var(--accent);color:#fff;border-color:var(--accent)">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="pane-cloudsetup" class="pane">
+    <h2 style="margin:0 0 6px;font-size:17px">Cloud Setup
+      <span style="font-weight:400;color:var(--muted);font-size:12px;margin-left:8px">
+        · Configure one or more cloud providers. Cloud Archive (in Space tab) uses these remotes to store and restore files.
+      </span>
+    </h2>
+
+    <!-- Setup wizard: full version, lives here -->
+    <div id="cloudSetup" style="display:none;background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:14px 18px;margin:14px 0;color:#7c2d12">
+      <div id="cloudSetupBody"></div>
+      <div style="margin-top:10px"><button onclick="refreshCloud()">Re-check</button></div>
+    </div>
+
+    <!-- Full remotes panel (with usage bars) -->
+    <div id="cloudRemotes" style="display:none;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 16px;margin:14px 0;font-size:13px"></div>
+
+    <!-- After-configured: how to add more / where to use -->
+    <div id="cloudSetupReady" style="display:none;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:12px 16px;margin:14px 0;color:#166534;font-size:13px;line-height:1.6">
+      <b>✓ Cloud is ready.</b><br>
+      Head to the <b>Space</b> tab → scan any folder under your home → use <b>☁️ Archive selected</b> to send cold assets to your remote. Restore from the <b>Archived items</b> panel anytime.
+      <div style="margin-top:8px;font-size:12px;color:#15803d">
+        To add another provider, run <code>rclone config</code> in Terminal and click Re-check below, or scroll up and pick another card.
+      </div>
+    </div>
+  </div>
+
+  <div id="pane-time" class="pane">
+    <div class="toolbar">
+      <label>Range
+        <select id="timeRange" onchange="refreshActivity()">
+          <option value="today">Today</option>
+          <option value="yesterday">Yesterday</option>
+          <option value="7days">Last 7 days</option>
+          <option value="30days">Last 30 days</option>
+        </select>
+      </label>
+      <button onclick="refreshActivity()">Refresh</button>
+      <span class="status" id="timeStatus"></span>
+    </div>
+    <div id="timeBanner" class="banner" style="display:none">
+      <span></span>
+    </div>
+    <div class="layout" style="grid-template-columns: minmax(0,1.2fr) minmax(0,1fr); align-items:start">
+      <section>
+        <h2>App time <span style="color:var(--muted);font-weight:400;font-size:12px" id="timeTotals"></span></h2>
+        <div id="appTimeRows" style="background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px"></div>
+      </section>
+      <section>
+        <h2>Top sites visited (browser history)</h2>
+        <table>
+          <thead><tr><th>Host</th><th>Browser</th><th class="num">Visits</th></tr></thead>
+          <tbody id="siteRows"></tbody>
+        </table>
+        <h2 style="margin-top: 18px">Top shell commands</h2>
+        <table>
+          <thead><tr><th>Command</th><th class="num">Count</th></tr></thead>
+          <tbody id="cmdRows"></tbody>
+        </table>
+      </section>
+    </div>
+  </div>
+
+<script>
+let procs = [], tabs = [], summary = {};
+let sortKey = "ram", sortDesc = true;
+let autoTimer = null, heartbeat = null;
+let maxRam = 1;
+
+document.querySelectorAll("#procTable th[data-key]").forEach(th => {
+  th.addEventListener("click", () => sortBy(th.dataset.key));
+});
+
+function sortBy(key) {
+  if (sortKey === key) sortDesc = !sortDesc;
+  else { sortKey = key; sortDesc = (key === "ram" || key === "cpu" || key === "pid"); }
+  render();
+}
+
+async function refresh() {
+  setStatus("Loading…", "");
+  try {
+    const r = await fetch("/data");
+    const j = await r.json();
+    procs = j.procs;
+    tabs = j.tabs;
+    summary = j.summary;
+    maxRam = Math.max(1, ...procs.map(p => p.ram));
+    const haveHeap = tabs.some(t => t.heap > 0);
+    document.getElementById("hintBanner").style.display =
+      (tabs.length > 0 && !haveHeap) ? "flex" : "none";
+    render();
+    setStatus(`${procs.length} processes  ·  ${tabs.length} Chrome tabs  ·  ${new Date().toLocaleTimeString()}`, "ok");
+  } catch (e) {
+    setStatus("Refresh failed: " + e.message, "err");
+  }
+}
+
+function setStatus(msg, cls) {
+  const el = document.getElementById("status");
+  el.textContent = msg;
+  el.className = "status " + cls;
+}
+
+function render() {
+  // Summary
+  const s = summary;
+  const items = [
+    {lbl: "Load", val: s.load, alert: parseFloat(s.load) > 30, warn: parseFloat(s.load) > 10},
+    {lbl: "Free RAM", val: s.free_mb + " MB", alert: s.free_mb < 500, warn: s.free_mb < 1000},
+    {lbl: "Compressor", val: s.comp_mb + " MB", alert: s.comp_mb > 4000, warn: s.comp_mb > 2000},
+    {lbl: "Swap", val: s.swap_mb + " MB", alert: s.swap_mb > 5000, warn: s.swap_mb > 1000},
+    {lbl: "Disk", val: s.disk_pct + " (" + s.disk_avail + " free)", alert: parseInt(s.disk_pct) > 90, warn: parseInt(s.disk_pct) > 80},
+    {lbl: "Chrome tabs", val: tabs.length}
+  ];
+  document.getElementById("summary").innerHTML = items.map(i =>
+    `<div class="item ${i.alert ? 'alert' : i.warn ? 'warn' : ''}">
+       <span class="lbl">${i.lbl}</span><span class="val">${i.val}</span>
+     </div>`).join("");
+
+  // Sort processes
+  procs.sort((a, b) => {
+    let av = a[sortKey], bv = b[sortKey];
+    if (typeof av === "string") { av = av.toLowerCase(); bv = bv.toLowerCase(); }
+    return (av < bv ? -1 : av > bv ? 1 : 0) * (sortDesc ? -1 : 1);
+  });
+
+  document.querySelectorAll("#procTable th[data-key]").forEach(th => {
+    th.classList.toggle("sorted", th.dataset.key === sortKey);
+    th.querySelector(".arrow").textContent =
+      (th.dataset.key === sortKey) ? (sortDesc ? "↓" : "↑") : "";
+  });
+
+  const sel = new Set([...document.querySelectorAll("#procRows .row-cb:checked")].map(cb => cb.dataset.pid));
+  document.getElementById("procRows").innerHTML = procs.map(p => {
+    const barWidth = Math.max(2, (p.ram / maxRam) * 60);
+    const isCritical = p.level === "critical";
+    const isRisky = p.level === "risky";
+    const checked = sel.has(String(p.pid)) ? "checked" : "";
+    const badge = p.type ? `<span class="badge ${p.type}">${p.type}</span>` : "";
+    const hint = p.hint ? `<span class="hint">${escapeHtml(p.hint)}</span>` : "";
+    const desc = p.desc ? `<span class="desc">${escapeHtml(p.desc)}</span>` : "";
+    let icon = "", title = "";
+    if (isCritical) { icon = "🛡️"; title = "Critical — killing this will break your Mac session. Kill is disabled."; }
+    else if (isRisky) { icon = "⚠️"; title = "Risky — will respawn or disrupt. Confirmation required."; }
+    const cb = isCritical
+      ? `<span class="level-icon" title="${title}">🛡️</span>`
+      : `<input type="checkbox" class="row-cb" data-pid="${p.pid}" data-level="${p.level}" ${checked} onchange="onRowSelChange(this)">`;
+    const rowCls = (sel.has(String(p.pid)) ? "selected " : "") + (isCritical ? "critical" : isRisky ? "risky" : "");
+    const warnCell = icon ? `<td class="warn-cell" title="${title}">${icon}</td>` : `<td></td>`;
+    return `<tr class="${rowCls}" data-pid="${p.pid}">
+      <td>${cb}</td>
+      ${warnCell}
+      <td class="num"><span class="ram-bar" style="width:${barWidth}px"></span>${p.ram}</td>
+      <td class="num">${p.cpu.toFixed(1)}</td>
+      <td title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</td>
+      <td class="wrap">${desc}</td>
+      <td>${badge}</td>
+      <td title="${escapeHtml(p.hint)}">${hint}</td>
+      <td class="num pid">${p.pid}</td>
+    </tr>`;
+  }).join("");
+
+  // Tabs (grouped by browser, then heap desc within each)
+  document.getElementById("tabCount").textContent = `(${tabs.length})`;
+  const tabSel = new Set([...document.querySelectorAll("#tabRows .tab-cb:checked")].map(cb => cb.dataset.tabkey));
+  const sortedTabs = [...tabs].sort((a, b) =>
+    (a.browser || "").localeCompare(b.browser || "") ||
+    (b.heap || 0) - (a.heap || 0) || a.window - b.window || a.tab - b.tab);
+  // Compute duplicate map: normalized URL -> [tab indexes]
+  // Normalization: strip fragment + common tracking params + trailing slash + lowercase host
+  function normalizeUrl(u) {
+    try {
+      const url = new URL(u);
+      const drop = ["utm_source","utm_medium","utm_campaign","utm_term","utm_content",
+                    "fbclid","gclid","mc_cid","mc_eid","ref","ref_src"];
+      drop.forEach(k => url.searchParams.delete(k));
+      url.hash = "";
+      let s = url.origin.toLowerCase() + url.pathname.replace(/\/$/, "") +
+              (url.search ? "?" + [...url.searchParams].sort().map(([k,v])=>`${k}=${v}`).join("&") : "");
+      return s;
+    } catch { return u; }
+  }
+  const dupGroups = new Map();
+  sortedTabs.forEach((t, i) => {
+    if (!t.url || t.url.startsWith("chrome://") || t.url.startsWith("brave://")) return;
+    const k = normalizeUrl(t.url);
+    if (!dupGroups.has(k)) dupGroups.set(k, []);
+    dupGroups.get(k).push(i);
+  });
+  const dupCount = [...dupGroups.values()].reduce((s, arr) => s + Math.max(0, arr.length - 1), 0);
+  document.getElementById("dupCount").textContent = dupCount > 0 ? `(${dupCount})` : "";
+
+  const myPort = window.location.port;
+  document.getElementById("tabRows").innerHTML = sortedTabs.map((t, i) => {
+    const key = `${t.browser}-${t.window}-${t.tab}`;
+    const heapMb = t.heap ? Math.round(t.heap / 1024 / 1024) : "—";
+    const checked = tabSel.has(key) ? "checked" : "";
+    let display = "", isMe = false;
+    try {
+      const u = new URL(t.url);
+      display = (u.hostname === "127.0.0.1" || u.hostname === "localhost")
+        ? `${u.hostname}:${u.port}` : u.hostname;
+      isMe = (u.hostname === "127.0.0.1" || u.hostname === "localhost") && u.port === myPort;
+    } catch { display = t.url; }
+    // Determine duplicate status
+    const groupKey = normalizeUrl(t.url);
+    const group = dupGroups.get(groupKey) || [i];
+    let status = "";
+    if (group.length > 1) {
+      if (group[0] === i) {
+        status = `<span class="dup-primary-badge" title="This is the first/primary tab; ${group.length-1} duplicate(s) elsewhere">PRIMARY ×${group.length}</span>`;
+      } else {
+        status = `<span class="dup-badge" title="Duplicate of an earlier tab — safe to close">DUPLICATE</span>`;
+      }
+    }
+    const tag = `<span class="browser-tag ${t.browser}"><span class="browser-dot ${t.browser}"></span>${t.browser}</span>`;
+    const meBadge = isMe ? '<span class="this-tab-badge">THIS WINDOW</span>' : "";
+    const isDup = group.length > 1 && group[0] !== i;
+    const closeBtn = isMe
+      ? `<button class="tiny" disabled title="Closing this tab will quit the tool">Close</button>`
+      : `<button class="tiny" onclick="closeOneTab('${escapeHtml(t.browser_app)}', ${t.window}, ${t.tab})">Close</button>`;
+    return `<tr class="${tabSel.has(key) ? 'selected ' : ''}${isMe ? 'this-tab' : ''} ${isDup ? 'is-dup' : ''}" data-tabkey="${key}" data-windowidx="${i}">
+      <td>${isMe ? "" : `<input type="checkbox" class="tab-cb" data-tabkey="${key}" data-app="${escapeHtml(t.browser_app)}" data-window="${t.window}" data-tab="${t.tab}" data-url="${escapeHtml(t.url)}" data-title="${escapeHtml(t.title)}" ${checked} onchange="onTabSelChange(this)">`}</td>
+      <td>${tag}</td>
+      <td class="col-tab">W${t.window}T${t.tab}</td>
+      <td>${status}</td>
+      <td class="tab-title-cell">
+        <div class="title">${escapeHtml(t.title)}${meBadge}</div>
+        <div class="url">${escapeHtml(display)}</div>
+      </td>
+      <td class="num">${heapMb}</td>
+      <td>
+        <button class="tiny" onclick="focusOneTab('${escapeHtml(t.browser_app)}', ${t.window}, ${t.tab})">Open</button>
+        ${isMe
+          ? `<button class="tiny" disabled title="Can't save the dashboard tab itself">Save</button>`
+          : `<button class="tiny" onclick="saveAndCloseOne('${escapeHtml(t.browser)}', '${escapeHtml(t.browser_app)}', ${t.window}, ${t.tab}, '${escapeHtml(t.url)}', '${escapeHtml(t.title)}')" title="Save to Read Later AND close this tab">Save</button>`}
+        ${closeBtn}
+      </td>
+    </tr>`;
+  }).join("");
+  // Stash for closeAllDuplicates / save handlers
+  window._lastTabs = sortedTabs;
+  window._dupGroups = dupGroups;
+}
+
+async function closeAllDuplicates() {
+  const groups = window._dupGroups || new Map();
+  const tabs = window._lastTabs || [];
+  const items = [];
+  for (const [k, idxs] of groups) {
+    if (idxs.length <= 1) continue;
+    // Skip the primary (idxs[0]) — close the rest
+    for (let i = 1; i < idxs.length; i++) {
+      const t = tabs[idxs[i]];
+      if (!t) continue;
+      items.push({app: t.browser_app, window: t.window, tab: t.tab});
+    }
+  }
+  if (items.length === 0) {
+    setStatus("No duplicates found", "ok");
+    return;
+  }
+  if (!confirm(`Close ${items.length} duplicate tab(s)?\n\nKeeping the first occurrence of each URL.`)) return;
+  const r = await fetch("/close-tab", { method: "POST",
+    headers: {"Content-Type":"application/json"}, body: JSON.stringify({items}) });
+  const j = await r.json();
+  setStatus(`Closed ${j.closed} duplicate(s)`, "ok");
+  setTimeout(refresh, 500);
+}
+
+async function saveAndCloseOne(browser, app, window, tab, url, title) {
+  // Optimistic: remove row immediately
+  _removeTabRow(app, window, tab);
+  setStatus("Saving & closing…", "");
+  await fetch("/readlater", { method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({items:[{browser, url, title}]}) });
+  await fetch("/close-tab", { method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({items:[{app, window, tab}]}) });
+  setStatus("Saved & closed", "ok");
+  setTimeout(refresh, 600);
+}
+
+function _selectedTabItems() {
+  return [...document.querySelectorAll("#tabRows .tab-cb:checked")].map(cb => ({
+    browser: cb.closest("tr").querySelector(".browser-tag")?.textContent.trim() || "",
+    app: cb.dataset.app,
+    window: parseInt(cb.dataset.window),
+    tab: parseInt(cb.dataset.tab),
+    url: cb.dataset.url,
+    title: cb.dataset.title,
+  }));
+}
+async function saveAndCloseSelected() {
+  const checked = [...document.querySelectorAll("#tabRows .tab-cb:checked")];
+  const items = _selectedTabItems();
+  if (items.length === 0) { setStatus("No tabs selected", "err"); return; }
+  // Optimistic: remove rows immediately
+  checked.forEach(cb => cb.closest("tr").remove());
+  setStatus(`Saving & closing ${items.length}…`, "");
+  await fetch("/readlater", { method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({items: items.map(x => ({browser: x.browser, url: x.url, title: x.title}))}) });
+  const closeItems = items.map(x => ({app: x.app, window: x.window, tab: x.tab}));
+  const r = await fetch("/close-tab", { method: "POST",
+    headers: {"Content-Type":"application/json"}, body: JSON.stringify({items: closeItems}) });
+  const j = await r.json();
+  setStatus(`Saved ${items.length} & closed ${j.closed} tab(s)`, "ok");
+  setTimeout(refresh, 600);
+}
+
+async function refreshReadLater() {
+  const el = document.getElementById("rlStatus");
+  el.textContent = "Loading…"; el.className = "status";
+  try {
+    const r = await fetch("/readlater");
+    const j = await r.json();
+    document.getElementById("rlCount").textContent = `(${j.items.length})`;
+    document.getElementById("rlRows").innerHTML = j.items.length === 0
+      ? `<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:24px">Empty. Save tabs from the Browser Tabs view.</td></tr>`
+      : j.items.map(it => {
+          let host = "";
+          try { host = new URL(it.url).hostname; } catch {}
+          const dt = new Date(it.saved_at).toLocaleString([], {month:"short",day:"numeric",hour:"numeric",minute:"2-digit"});
+          return `<tr>
+            <td style="color:var(--muted);font-size:12px">${escapeHtml(dt)}</td>
+            <td><span class="browser-tag ${it.browser}"><span class="browser-dot ${it.browser}"></span>${it.browser}</span></td>
+            <td class="tab-title-cell"><div class="title">${escapeHtml(it.title)}</div><div class="url"><a href="${escapeHtml(it.url)}" target="_blank" rel="noopener" style="color:var(--muted)">${escapeHtml(host || it.url)}</a></div></td>
+            <td>
+              <button class="tiny" onclick="openReadLater('${escapeHtml(it.id)}', '${escapeHtml(it.url)}')">Open</button>
+              <button class="tiny" onclick="openAndRemoveRl('${escapeHtml(it.id)}', '${escapeHtml(it.url)}')">Open &amp; Remove</button>
+              <button class="tiny" onclick="removeReadLater('${escapeHtml(it.id)}')">Remove</button>
+            </td>
+          </tr>`;
+        }).join("");
+    el.textContent = "Updated " + new Date().toLocaleTimeString();
+    el.className = "status ok";
+  } catch (e) {
+    el.textContent = "Failed: " + e.message;
+    el.className = "status err";
+  }
+}
+function openReadLater(id, url) { window.open(url, "_blank"); }
+async function openAndRemoveRl(id, url) {
+  window.open(url, "_blank");
+  await removeReadLater(id);
+}
+async function removeReadLater(id) {
+  await fetch("/readlater?id=" + encodeURIComponent(id), { method: "DELETE" });
+  refreshReadLater();
+}
+async function exportReadLater() {
+  const r = await fetch("/readlater");
+  const j = await r.json();
+  const blob = new Blob([JSON.stringify(j.items, null, 2)], {type: "application/json"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "read-later-" + new Date().toISOString().slice(0,10) + ".json";
+  a.click();
+}
+
+async function closeOtherMhealthTabs() {
+  const myPort = window.location.port;
+  // Identify other 127.0.0.1 tabs whose title looks like Mac Health
+  const candidates = tabs.filter(t => {
+    try {
+      const u = new URL(t.url);
+      if (u.hostname !== "127.0.0.1" && u.hostname !== "localhost") return false;
+      if (u.port === myPort) return false;
+      return /Mac Health/i.test(t.title) || /Kill Processes/i.test(t.title);
+    } catch { return false; }
+  });
+  if (candidates.length === 0) {
+    setStatus("No other Mac Health tabs found", "ok");
+    return;
+  }
+  if (!confirm(`Close ${candidates.length} other Mac Health tab(s)?\n\n` +
+               candidates.map(t => `  • ${t.browser} W${t.window}T${t.tab} — ${t.title}`).join("\n"))) return;
+  const items = candidates.map(t => ({app: t.browser_app, window: t.window, tab: t.tab}));
+  const r = await fetch("/close-tab", { method: "POST",
+    headers: {"Content-Type":"application/json"}, body: JSON.stringify({items}) });
+  const j = await r.json();
+  // Also kill the orphan server processes (they're still running on other ports)
+  await fetch("/kill-orphan-servers", { method: "POST" }).catch(() => {});
+  setStatus(`Closed ${j.closed} tab(s) + signaled orphan servers`, "ok");
+  setTimeout(refresh, 600);
+}
+
+function escapeHtml(s) {
+  return String(s || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function onRowSelChange(cb) { cb.closest("tr").classList.toggle("selected", cb.checked); }
+function onTabSelChange(cb) { cb.closest("tr").classList.toggle("selected", cb.checked); }
+
+function toggleAll() {
+  const all = document.getElementById("selAll").checked;
+  document.querySelectorAll("#procRows .row-cb").forEach(cb => {
+    cb.checked = all; cb.closest("tr").classList.toggle("selected", all);
+  });
+}
+function toggleAllTabs() {
+  const all = document.getElementById("tabSelAll").checked;
+  document.querySelectorAll("#tabRows .tab-cb").forEach(cb => {
+    cb.checked = all; cb.closest("tr").classList.toggle("selected", all);
+  });
+}
+
+async function killSelected() {
+  const checked = [...document.querySelectorAll("#procRows .row-cb:checked")];
+  const pids = checked.map(cb => cb.dataset.pid);
+  if (pids.length === 0) { setStatus("Nothing selected", "err"); return; }
+
+  // Risky-process gate: any in selection?
+  const risky = checked.filter(cb => cb.dataset.level === "risky").map(cb => {
+    const p = procs.find(x => String(x.pid) === cb.dataset.pid);
+    return p ? `${p.name} — ${p.desc || ''}` : cb.dataset.pid;
+  });
+
+  if (document.getElementById("confirm").checked || risky.length > 0) {
+    const names = pids.slice(0, 6).map(pid => {
+      const p = procs.find(x => String(x.pid) === pid);
+      const tag = p && p.level === "risky" ? " ⚠️" : "";
+      return p ? `${p.name} (${p.ram}MB)${tag}${p.hint ? ' — ' + p.hint : ''}` : pid;
+    });
+    const more = pids.length > 6 ? `\n…and ${pids.length - 6} more` : "";
+    let msg = `Kill ${pids.length} process(es)?\n\n${names.join("\n")}${more}`;
+    if (risky.length > 0) {
+      msg += `\n\n⚠️ ${risky.length} risky process(es): may disrupt UI / cause respawn.`;
+    }
+    if (!confirm(msg)) return;
+  }
+  // Detect Chrome renderers — warn user the tab will show "Aw, snap!"
+  const rendererCount = checked.filter(cb => {
+    const p = procs.find(x => String(x.pid) === cb.dataset.pid);
+    return p && p.type === "renderer";
+  }).length;
+  if (rendererCount > 0) {
+    const ok = confirm(
+      `${rendererCount} of your selection ${rendererCount === 1 ? "is a Chrome renderer" : "are Chrome renderers"}.\n\n` +
+      `Killing a renderer leaves the Chrome tab showing "Aw, snap!" — the tab itself stays open.\n\n` +
+      `For a clean tab close, cancel and use the Chrome Tabs section below.\n\n` +
+      `Continue with kill?`
+    );
+    if (!ok) return;
+  }
+
+  pids.forEach(pid => {
+    const tr = document.querySelector(`#procRows tr[data-pid="${pid}"]`);
+    if (tr) tr.classList.add("killing");
+  });
+  setStatus(`Killing ${pids.length}…`, "");
+  try {
+    const r = await fetch("/kill", { method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify({pids}) });
+    const j = await r.json();
+    let msg = `✓ Killed ${j.killed}`;
+    if (j.failed) msg += `, ${j.failed} failed`;
+    if (j.blocked) msg += `, ${j.blocked} blocked (critical)`;
+    setStatus(msg, j.failed || j.blocked ? "err" : "ok");
+    setTimeout(refresh, 250);
+  } catch (e) {
+    setStatus("Kill failed: " + e.message, "err");
+  }
+}
+
+function _removeTabRow(app, window, tab) {
+  // Find the row by matching its checkbox attributes
+  const cb = document.querySelector(
+    `#tabRows .tab-cb[data-app="${app.replace(/"/g, '\\"')}"][data-window="${window}"][data-tab="${tab}"]`
+  );
+  if (cb) cb.closest("tr").remove();
+  // Also handle the dashboard's own row (no checkbox) by matching tabkey
+  const tabkey = (typeof arguments[3] === "string") ? arguments[3] : null;
+  if (tabkey) {
+    const tr = document.querySelector(`#tabRows tr[data-tabkey="${tabkey}"]`);
+    if (tr) tr.remove();
+  }
+}
+
+async function closeOneTab(app, window, tab) {
+  // Optimistic: remove row immediately
+  _removeTabRow(app, window, tab);
+  setStatus("Closing tab…", "");
+  const r = await fetch("/close-tab", { method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({items: [{app, window, tab}]}) });
+  const j = await r.json();
+  setStatus(`Closed ${j.closed} tab`, j.closed ? "ok" : "err");
+  setTimeout(refresh, 600);  // background re-sync
+}
+async function focusOneTab(app, window, tab) {
+  await fetch("/focus-tab", { method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({app, window, tab}) });
+}
+async function closeSelectedTabs() {
+  const checked = [...document.querySelectorAll("#tabRows .tab-cb:checked")];
+  const items = checked.map(cb =>
+    ({app: cb.dataset.app, window: parseInt(cb.dataset.window), tab: parseInt(cb.dataset.tab)}));
+  if (items.length === 0) { setStatus("No tabs selected", "err"); return; }
+  // Optimistic: remove rows immediately
+  checked.forEach(cb => cb.closest("tr").remove());
+  setStatus(`Closing ${items.length} tab(s)…`, "");
+  const r = await fetch("/close-tab", { method: "POST",
+    headers: {"Content-Type":"application/json"}, body: JSON.stringify({items}) });
+  const j = await r.json();
+  setStatus(`Closed ${j.closed} tab(s)`, "ok");
+  setTimeout(refresh, 600);
+}
+
+function toggleAuto() {
+  if (document.getElementById("autoRefresh").checked) {
+    if (!autoTimer) autoTimer = setInterval(refresh, 5000);
+  } else { clearInterval(autoTimer); autoTimer = null; }
+}
+
+function startHeartbeat() {
+  heartbeat = setInterval(() => fetch("/ping").catch(() => {}), 15000);
+}
+window.addEventListener("beforeunload", () => {
+  navigator.sendBeacon("/quit", "");
+});
+
+// --- Tab switcher ---
+function switchTab(name) {
+  // Back-compat: old bookmarks. "space"/"disk" → caches (the most likely intent).
+  if (name === "space" || name === "disk") name = "caches";
+  if (name === "cloud") name = "cloudsetup";
+  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.pane === name));
+  document.querySelectorAll(".pane").forEach(p => p.classList.toggle("active", p.id === "pane-" + name));
+  if (name === "caches") refreshDisk(false);
+  if (name === "archive") refreshCloud();
+  if (name === "cloudsetup") refreshCloud();
+  if (name === "time") refreshActivity();
+  if (name === "readlater") refreshReadLater();
+  if (name === "projects") refreshProjects();
+  if (name === "processes" || name === "tabs") refresh();
+}
+
+// --- Notification snooze -------------------------------------------------
+
+function toggleSnoozeMenu() {
+  const m = document.getElementById("snoozeMenu");
+  m.style.display = m.style.display === "none" ? "block" : "none";
+}
+document.addEventListener("click", (e) => {
+  const wrap = document.getElementById("snoozeWrap");
+  if (wrap && !wrap.contains(e.target)) {
+    const m = document.getElementById("snoozeMenu");
+    if (m) m.style.display = "none";
+  }
+});
+
+async function setSnooze(seconds) {
+  document.getElementById("snoozeMenu").style.display = "none";
+  try {
+    const r = await fetch("/snooze", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({seconds}),
+    });
+    const j = await r.json();
+    renderSnooze(j);
+  } catch (e) {
+    alert("Snooze failed: " + e.message);
+  }
+}
+
+function setSnoozeTomorrow() {
+  const now = new Date();
+  const target = new Date(now);
+  target.setDate(target.getDate() + 1);
+  target.setHours(9, 0, 0, 0);
+  const secs = Math.floor((target - now) / 1000);
+  setSnooze(secs);
+}
+
+function renderSnooze(j) {
+  const status = document.getElementById("snoozeStatus");
+  const btn = document.getElementById("snoozeBtn");
+  if (!j || !j.snoozed) {
+    status.style.display = "inline-block";
+    status.textContent = "🔔 Alerts on";
+    status.style.background = "#d1fae5";
+    status.style.color = "#065f46";
+    btn.textContent = "Snooze ▾";
+    return;
+  }
+  const remaining = j.remaining_seconds;
+  const untilDate = new Date(j.until * 1000);
+  const hh = String(untilDate.getHours()).padStart(2, "0");
+  const mm = String(untilDate.getMinutes()).padStart(2, "0");
+  let label;
+  if (remaining > 24 * 3600) {
+    const days = Math.ceil(remaining / 86400);
+    label = `🔕 Snoozed ${days}d`;
+  } else if (remaining > 3600) {
+    const hrs = Math.round(remaining / 3600);
+    label = `🔕 Snoozed (until ${hh}:${mm})`;
+  } else {
+    const mins = Math.ceil(remaining / 60);
+    label = `🔕 Snoozed (${mins}m left)`;
+  }
+  status.style.display = "inline-block";
+  status.textContent = label;
+  status.style.background = "#fed7aa";
+  status.style.color = "#7c2d12";
+  btn.textContent = "Change ▾";
+}
+
+async function refreshSnooze() {
+  try {
+    const r = await fetch("/snooze");
+    renderSnooze(await r.json());
+  } catch (e) {
+    // silent — chip just stays hidden
+  }
+}
+
+// Refresh on load + every 30 s (so the countdown updates without manual refresh)
+refreshSnooze();
+setInterval(refreshSnooze, 30 * 1000);
+
+// Hover effect for menu items
+document.addEventListener("mouseover", (e) => {
+  if (e.target.classList && e.target.classList.contains("snoozeItem")) {
+    e.target.style.background = "#f3f4f6";
+  }
+});
+document.addEventListener("mouseout", (e) => {
+  if (e.target.classList && e.target.classList.contains("snoozeItem")) {
+    e.target.style.background = "";
+  }
+});
+
+// --- Cloud Archive -------------------------------------------------------
+let cloudState = { rclone_available: false, remotes: [], archives: [] };
+let scanResult = null;
+
+// Helper: render a code block with a copy-to-clipboard button.
+function codeBlockWithCopy(code, label) {
+  const id = "code-" + Math.random().toString(36).slice(2, 10);
+  const safe = escapeHtml(code);
+  return `<div style="position:relative;background:#1f2937;color:#f9fafb;border-radius:6px;padding:10px 70px 10px 14px;margin:6px 0;font-family:ui-monospace,Menlo,monospace;font-size:12px;overflow:auto;white-space:pre"><span id="${id}">${safe}</span><button onclick="copyCodeBlock('${id}', this)" style="position:absolute;top:6px;right:6px;background:#374151;color:#f9fafb;border:1px solid #4b5563;border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer">Copy</button></div>`;
+}
+
+async function copyCodeBlock(id, btn) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  try {
+    await navigator.clipboard.writeText(el.textContent);
+    const orig = btn.textContent;
+    btn.textContent = "✓ Copied";
+    btn.style.background = "#065f46";
+    setTimeout(() => { btn.textContent = orig; btn.style.background = "#374151"; }, 1500);
+  } catch (e) {
+    btn.textContent = "Failed";
+  }
+}
+
+// Helper: a provider chooser card.
+function providerCard(id, name, tagline, freeTier, blurb) {
+  return `<div onclick="showRecipe('${id}')" style="background:#fff;border:1px solid #fed7aa;border-radius:8px;padding:12px;cursor:pointer;transition:all 0.15s" onmouseover="this.style.borderColor='#f97316';this.style.boxShadow='0 2px 8px rgba(249,115,22,0.15)'" onmouseout="this.style.borderColor='#fed7aa';this.style.boxShadow='none'">
+    <div style="font-weight:600;font-size:14px;color:#111827;margin-bottom:2px">${escapeHtml(name)}</div>
+    <div style="font-size:11px;color:#f97316;margin-bottom:6px">${escapeHtml(tagline)} · ${escapeHtml(freeTier)}</div>
+    <div style="font-size:11px;color:#6b7280;line-height:1.4">${escapeHtml(blurb)}</div>
+  </div>`;
+}
+
+// Helper: render a provider recipe inline. Called when a card is clicked.
+function showRecipe(provider) {
+  const el = document.getElementById("providerRecipe");
+  el.style.display = "block";
+  el.innerHTML = RECIPES[provider] || "";
+  el.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+// Step block builder.
+function step(n, title, body) {
+  return `<div style="display:flex;gap:12px;margin:10px 0;padding:10px 12px;background:#fff;border:1px solid #fed7aa;border-radius:6px">
+    <div style="flex:0 0 28px;height:28px;background:#f97316;color:#fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:13px">${n}</div>
+    <div style="flex:1;color:#111827;font-size:13px;line-height:1.55"><div style="font-weight:600;margin-bottom:4px">${title}</div>${body}</div>
+  </div>`;
+}
+
+// Provider recipes — same structure for all three.
+const RECIPES = {
+  r2: `<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:14px;margin-top:10px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h4 style="margin:0;color:#111827;font-size:14px">Cloudflare R2 setup</h4>
+      <button onclick="document.getElementById('providerRecipe').style.display='none'" style="background:transparent;border:none;color:#6b7280;cursor:pointer;font-size:18px;padding:0 4px">×</button>
+    </div>
+    ${step(1, "Sign up free at Cloudflare", `Open <a href="https://dash.cloudflare.com/sign-up" target="_blank" rel="noopener" style="color:#f97316">dash.cloudflare.com/sign-up</a> (skip if you already have an account).`)}
+    ${step(2, "Create the bucket", `Dashboard → <b>R2 Object Storage</b> → <b>Create bucket</b> → name it <code>mhealth-archive</code> → leave location automatic → Create.`)}
+    ${step(3, "Create an API token", `Still in R2 → <b>Manage R2 API Tokens</b> → <b>Create API Token</b>:<ul style="margin:4px 0 0 18px;padding:0;font-size:12px;line-height:1.6"><li>Token name: <code>mhealth-archive-token</code></li><li>Permissions: <b>Object Read &amp; Write</b></li><li>Specify bucket: <b>Apply to specific buckets only</b> → <code>mhealth-archive</code></li><li>TTL: Forever</li><li>Click <b>Create API Token</b></li></ul>`)}
+    ${step(4, "Copy three values (you only see them once)", `<ul style="margin:0 0 0 18px;padding:0;font-size:12px;line-height:1.6"><li><b>Access Key ID</b></li><li><b>Secret Access Key</b></li><li><b>Account ID</b> (find it on the R2 page sidebar — looks like <code>a1b2c3d4e5f6…</code>)</li></ul>`)}
+    ${step(5, "Open Terminal and run", codeBlockWithCopy("rclone config"))}
+    ${step(6, "Answer the prompts (paste yours where shown)", codeBlockWithCopy(`n/s/q>  n
+name>   r2
+Storage> 4
+provider> Cloudflare
+env_auth> 1
+access_key_id> <paste yours>
+secret_access_key> <paste yours>
+region>
+endpoint> https://<your-account-id>.r2.cloudflarestorage.com
+location_constraint>
+acl> 1
+Edit advanced config? n
+Keep this "r2" remote? y
+n/s/q> q`))}
+    ${step(7, "Click Re-check below", `Your remote should appear in the Remotes panel. You're done.`)}
+    <div style="text-align:right;margin-top:8px"><button onclick="refreshCloud()" style="background:#f97316;color:#fff;border:none;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer">Re-check</button></div>
+  </div>`,
+
+  gdrive: `<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:14px;margin-top:10px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h4 style="margin:0;color:#111827;font-size:14px">Google Drive setup</h4>
+      <button onclick="document.getElementById('providerRecipe').style.display='none'" style="background:transparent;border:none;color:#6b7280;cursor:pointer;font-size:18px;padding:0 4px">×</button>
+    </div>
+    ${step(1, "Open Terminal and run", codeBlockWithCopy("rclone config"))}
+    ${step(2, "Answer the prompts", codeBlockWithCopy(`n/s/q>  n
+name>   gdrive
+Storage> 24
+client_id>
+client_secret>
+scope> 1
+service_account_file>
+Edit advanced config? n
+Use auto config? y
+                              ← browser opens automatically
+                              ← sign in to your Google account
+                              ← grant access → see "Success!" page
+Configure as Shared Drive? n
+Keep this "gdrive" remote? y
+n/s/q> q`))}
+    ${step(3, "Click Re-check below", `Your remote should appear in the Remotes panel.`)}
+    <div style="text-align:right;margin-top:8px"><button onclick="refreshCloud()" style="background:#f97316;color:#fff;border:none;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer">Re-check</button></div>
+  </div>`,
+
+  mega: `<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:14px;margin-top:10px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h4 style="margin:0;color:#111827;font-size:14px">Mega setup</h4>
+      <button onclick="document.getElementById('providerRecipe').style.display='none'" style="background:transparent;border:none;color:#6b7280;cursor:pointer;font-size:18px;padding:0 4px">×</button>
+    </div>
+    ${step(1, "Sign up free if you don't have an account", `Open <a href="https://mega.io" target="_blank" rel="noopener" style="color:#f97316">mega.io</a> and create an account. <b>You don't need the MEGA desktop app</b> — quit/skip its setup wizard if it pops up.`)}
+    ${step(2, "Open Terminal and run", codeBlockWithCopy("rclone config"))}
+    ${step(3, "Answer the prompts (use your Mega email + password)", codeBlockWithCopy(`n/s/q>  n
+name>   mega
+Storage> 39
+user>   your-email@example.com
+y/g/n>  y
+password: ********
+Confirm password: ********
+Edit advanced config? n
+Keep this "mega" remote? y
+n/s/q> q`))}
+    ${step(4, "Click Re-check below", `Your remote should appear in the Remotes panel.`)}
+    <div style="text-align:right;margin-top:8px"><button onclick="refreshCloud()" style="background:#f97316;color:#fff;border:none;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer">Re-check</button></div>
+  </div>`,
+};
+
+function fmtBytes(n) {
+  if (n == null) return "—";
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n/1024).toFixed(1) + " KB";
+  if (n < 1073741824) return (n/1048576).toFixed(1) + " MB";
+  return (n/1073741824).toFixed(2) + " GB";
+}
+
+async function refreshCloud() {
+  const archEl = document.getElementById("archStatus");
+  archEl.textContent = "Loading…"; archEl.className = "status";
+  try {
+    const r = await fetch("/cloud");
+    cloudState = await r.json();
+    renderCloudHeader();
+    renderArchives();
+    archEl.textContent = "Updated " + new Date().toLocaleTimeString();
+    archEl.className = "status ok";
+  } catch (e) {
+    archEl.textContent = "Failed: " + e.message;
+    archEl.className = "status err";
+  }
+}
+
+function renderCloudHeader() {
+  const setupEl = document.getElementById("cloudSetup");
+  const setupBody = document.getElementById("cloudSetupBody");
+  const remotesEl = document.getElementById("cloudRemotes");
+  const remoteSelect = document.getElementById("archiveRemote");
+  // Compact versions on the Space tab
+  const hintEl = document.getElementById("cloudSetupHint");
+  const hintTextEl = document.getElementById("cloudSetupHintText");
+  const compactRemotesEl = document.getElementById("cloudRemotesCompact");
+  const readyEl = document.getElementById("cloudSetupReady");
+  const showHint = (text) => {
+    if (hintEl && hintTextEl) { hintTextEl.textContent = text; hintEl.style.display = "flex"; }
+    if (compactRemotesEl) compactRemotesEl.style.display = "none";
+  };
+  const hideHint = () => { if (hintEl) hintEl.style.display = "none"; };
+  const showReady = () => { if (readyEl) readyEl.style.display = "block"; };
+  const hideReady = () => { if (readyEl) readyEl.style.display = "none"; };
+
+  if (!cloudState.rclone_available) {
+    setupEl.style.display = "block";
+    setupBody.innerHTML = `
+      <h3 style="margin:0 0 12px;font-size:15px;color:#7c2d12">Step 1 of 2 — Install rclone</h3>
+      <div style="margin-bottom:8px">Open Terminal and run:</div>
+      ${codeBlockWithCopy("brew install rclone")}
+      <div style="font-size:12px;margin-top:10px;color:#92400e">
+        Don't have Homebrew? Install it first from <a href="https://brew.sh" target="_blank" rel="noopener" style="color:#92400e;font-weight:600">brew.sh</a>.
+      </div>
+      <div style="margin-top:14px;font-size:12px;color:#7c2d12">
+        rclone is a single command-line tool that bridges to 30+ cloud providers. Free, open-source, no account needed for the tool itself.
+      </div>`;
+    remotesEl.style.display = "none";
+    hideReady();
+    showHint("☁️ rclone isn't installed. Cloud Archive needs it — go to Cloud Setup tab to install.");
+    return;
+  }
+  if ((cloudState.remotes || []).length === 0) {
+    setupEl.style.display = "block";
+    setupBody.innerHTML = `
+      <h3 style="margin:0 0 6px;font-size:15px;color:#7c2d12">Step 2 of 2 — Pick a cloud provider</h3>
+      <div style="font-size:12px;color:#92400e;margin-bottom:14px">Click a provider below for step-by-step setup. You only need one. You can add more later.</div>
+      <div id="providerCards" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:12px">
+        ${providerCard("r2",     "Cloudflare R2",  "Best for heavy use",  "10 GB free",  "Zero egress fees — restores cost nothing. Best technical fit, ~10 min setup.")}
+        ${providerCard("gdrive", "Google Drive",   "Easiest setup",       "15 GB free",  "OAuth in browser — fastest setup, ~3 min. No tokens to copy.")}
+        ${providerCard("mega",   "Mega",           "Most free space",     "20 GB free",  "Just email + password. Slower up/down (encryption-first), ~3 min setup.")}
+      </div>
+      <div id="providerRecipe" style="display:none"></div>`;
+    remotesEl.style.display = "none";
+    remoteSelect.innerHTML = "";
+    hideReady();
+    showHint("☁️ No cloud remote configured yet. You can still delete regenerable items here, but archiving needs setup.");
+    return;
+  }
+
+  // Have rclone + remotes — show summary + populate select
+  setupEl.style.display = "none";
+  const lines = cloudState.remotes.map(r => {
+    const has = r.total != null;
+    const pct = has && r.total > 0 ? ((r.used || 0) / r.total * 100).toFixed(1) : null;
+    const bar = has ? `<div style="display:inline-block;vertical-align:middle;width:140px;height:8px;background:#e5e7eb;border-radius:4px;margin:0 8px;overflow:hidden"><div style="height:100%;width:${pct||0}%;background:var(--accent)"></div></div>` : "";
+    const usage = has
+      ? `${fmtBytes(r.used)} used · ${fmtBytes(r.free)} free of ${fmtBytes(r.total)}${pct?' ('+pct+'%)':''}`
+      : '<span style="color:var(--muted)">usage info unavailable for this backend</span>';
+    return `<div style="margin:4px 0"><b>${escapeHtml(r.name)}</b> <span style="color:var(--muted);font-size:11px">[${escapeHtml(r.type)}]</span> ${bar} ${usage}</div>`;
+  });
+  remotesEl.innerHTML = "<b>Configured remotes</b>" + lines.join("");
+  remotesEl.style.display = "block";
+  showReady();
+
+  // Compact remotes line for Space tab
+  if (compactRemotesEl) {
+    const summary = cloudState.remotes.map(r => {
+      const has = r.total != null;
+      const u = has ? ` (${fmtBytes(r.used)}/${fmtBytes(r.total)})` : "";
+      return `<b>${escapeHtml(r.name)}</b>${u}`;
+    }).join(" · ");
+    compactRemotesEl.innerHTML = `☁️ Cloud ready: ${summary}`;
+    compactRemotesEl.style.display = "block";
+  }
+  hideHint();
+
+  // Populate archive-target select
+  const current = remoteSelect.value;
+  remoteSelect.innerHTML = cloudState.remotes
+    .map(r => `<option value="${escapeHtml(r.name)}">${escapeHtml(r.name)}</option>`).join("");
+  if (current && cloudState.remotes.find(r => r.name === current)) remoteSelect.value = current;
+}
+
+function renderArchives() {
+  const rows = document.getElementById("archRows");
+  const archives = cloudState.archives || [];
+  rows.innerHTML = archives.length === 0
+    ? `<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:20px">No archives yet.</td></tr>`
+    : archives.map(a => {
+        const dt = new Date(a.archived_at).toLocaleString([], {month:"short",day:"numeric",hour:"numeric",minute:"2-digit"});
+        return `<tr>
+          <td><code style="font-size:11px;word-break:break-all">${escapeHtml(a.original_path)}</code><div style="color:var(--muted);font-size:11px;margin-top:2px">archived ${escapeHtml(dt)}</div></td>
+          <td><span class="badge">${escapeHtml(a.remote)}</span></td>
+          <td class="num">${fmtBytes(a.size_bytes)}</td>
+          <td>
+            <button class="tiny" onclick="restoreArchive('${escapeHtml(a.id)}')">Restore</button>
+            <button class="tiny danger" onclick="deleteArchiveItem('${escapeHtml(a.id)}','${escapeHtml(a.original_path)}')">Delete from cloud</button>
+          </td>
+        </tr>`;
+      }).join("");
+}
+
+function setScanPreset(path) {
+  document.getElementById("scanPath").value = path;
+  scanFolder();
+}
+
+async function pickFolder() {
+  const el = document.getElementById("scanStatus");
+  el.textContent = "Opening folder picker…"; el.className = "status";
+  try {
+    const r = await fetch("/cloud/pick-folder");
+    const j = await r.json();
+    if (j.ok && j.path) {
+      // Append to existing input (so user can build multi-path lists by browsing repeatedly)
+      const existing = document.getElementById("scanPath").value.trim();
+      const home = window.__HOME__ || "";
+      const displayed = home && j.path.startsWith(home + "/") ? "~" + j.path.slice(home.length) : j.path;
+      document.getElementById("scanPath").value = existing ? existing + ", " + displayed : displayed;
+      el.textContent = "Picked: " + displayed;
+      el.className = "status ok";
+      scanFolder();
+    } else if (j.cancelled) {
+      el.textContent = "Cancelled"; el.className = "status";
+    } else {
+      el.textContent = "Picker failed: " + (j.error || "unknown"); el.className = "status err";
+    }
+  } catch (e) {
+    el.textContent = "Failed: " + e.message; el.className = "status err";
+  }
+}
+
+async function scanHomeOverview() {
+  const el = document.getElementById("scanStatus");
+  el.textContent = "Scanning home overview…"; el.className = "status";
+  try {
+    const r = await fetch("/cloud/home-overview");
+    const j = await r.json();
+    if (!j.ok) { el.textContent = "Error: " + j.error; el.className = "status err"; return; }
+    // Synthesize a scan-result shape so existing rendering works
+    const items = j.items.map(it => ({
+      name: it.name, path: it.path, is_dir: it.is_dir, size_bytes: it.size_bytes,
+      category: it.is_dir && it.size_bytes > 100 * 1024 * 1024 ? "archive" : "keep",
+      reason: it.is_dir
+        ? `Top-level home folder (${it.is_dir ? "directory" : "file"}). Click into a specific folder for full classification.`
+        : "File in home root",
+    }));
+    scanResult = {
+      ok: true,
+      target: j.home + " (overview)",
+      items,
+      totals_bytes: items.reduce((acc, it) => {
+        acc[it.category] = (acc[it.category] || 0) + it.size_bytes; return acc;
+      }, {delete: 0, archive: 0, keep: 0, check: 0}),
+    };
+    renderScanResult();
+    el.textContent = `Home overview: ${j.items.length} folder(s). Click into each for detail.`;
+    el.className = "status ok";
+  } catch (e) {
+    el.textContent = "Failed: " + e.message; el.className = "status err";
+  }
+}
+
+async function scanFolder() {
+  const path = document.getElementById("scanPath").value.trim();
+  if (!path) { alert("Enter a path to scan, click 📂 Browse, or pick a preset."); return; }
+  const el = document.getElementById("scanStatus");
+  el.textContent = "Scanning…"; el.className = "status";
+  try {
+    const r = await fetch("/cloud/scan?path=" + encodeURIComponent(path));
+    const j = await r.json();
+    if (!j.ok && !j.items) { el.textContent = "Error: " + j.error; el.className = "status err"; return; }
+    scanResult = j;
+    renderScanResult();
+    const errPart = (j.errors && j.errors.length) ? ` (${j.errors.length} path failed)` : "";
+    el.textContent = `Scanned ${j.items.length} item(s)${errPart}`;
+    el.className = j.errors && j.errors.length ? "status err" : "status ok";
+  } catch (e) {
+    el.textContent = "Failed: " + e.message;
+    el.className = "status err";
+  }
+}
+
+function renderScanResult() {
+  if (!scanResult) return;
+  document.getElementById("scanLegend").style.display = "block";
+  document.getElementById("scanActions").style.display = "block";
+  document.getElementById("scanTable").style.display = "table";
+
+  const t = scanResult.totals_bytes || {};
+  document.getElementById("scanTotals").style.display = "block";
+  document.getElementById("scanTotals").innerHTML = `
+    <b>Totals:</b>
+    🗑 ${fmtBytes(t.delete || 0)} regenerable ·
+    ☁️ ${fmtBytes(t.archive || 0)} cold ·
+    ⚠️ ${fmtBytes(t.check || 0)} git repos ·
+    🔒 ${fmtBytes(t.keep || 0)} keep`;
+
+  const icon = (c) => ({delete:"🗑", archive:"☁️", check:"⚠️", keep:"🔒"}[c] || "");
+  const sorted = [...scanResult.items].sort((a, b) => b.size_bytes - a.size_bytes);
+  document.getElementById("scanRows").innerHTML = sorted.map(it => `
+    <tr data-category="${escapeHtml(it.category)}">
+      <td><input type="checkbox" class="scan-cb" data-path="${escapeHtml(it.path)}" data-category="${escapeHtml(it.category)}"></td>
+      <td style="font-size:16px;text-align:center">${icon(it.category)}</td>
+      <td><b>${escapeHtml(it.name)}</b>${it.is_dir ? '<span style="color:var(--muted);font-size:11px"> /</span>' : ''}</td>
+      <td class="num">${fmtBytes(it.size_bytes)}</td>
+      <td><span class="badge">${escapeHtml(it.category)}</span></td>
+      <td><span class="desc">${escapeHtml(it.reason)}</span></td>
+    </tr>`).join("");
+}
+
+function toggleAllScan() {
+  const on = document.getElementById("scanSelAll").checked;
+  document.querySelectorAll(".scan-cb").forEach(cb => cb.checked = on);
+}
+
+function selectedScan(category) {
+  return Array.from(document.querySelectorAll(".scan-cb"))
+    .filter(cb => cb.checked && (!category || cb.dataset.category === category))
+    .map(cb => cb.dataset.path);
+}
+
+async function deleteRegenerableSelected() {
+  const paths = selectedScan("delete");
+  if (paths.length === 0) {
+    alert("No items in 'delete' category are selected.\\nTip: click the header checkbox to select all, then this button will only act on 🗑 items.");
+    return;
+  }
+  if (!confirm(`Delete ${paths.length} regenerable item(s)? They will be re-created by npm install / docker pull / build tools when needed.`)) return;
+  const r = await fetch("/cloud/delete-bulk", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({paths}),
+  });
+  const j = await r.json();
+  alert(`Deleted ${j.deleted}, failed ${j.failed.length}, skipped ${j.skipped.length}.`);
+  scanFolder();
+}
+
+async function archiveSelected() {
+  const remote = document.getElementById("archiveRemote").value;
+  if (!remote) { alert("Select a remote first."); return; }
+  // Allow archive or check categories (user accepts risk on check via confirm)
+  const archivable = Array.from(document.querySelectorAll(".scan-cb"))
+    .filter(cb => cb.checked && (cb.dataset.category === "archive" || cb.dataset.category === "check"))
+    .map(cb => cb.dataset.path);
+  if (archivable.length === 0) {
+    alert("No archivable items selected (need ☁️ or ⚠️ category).");
+    return;
+  }
+  const hasCheck = Array.from(document.querySelectorAll(".scan-cb"))
+    .some(cb => cb.checked && cb.dataset.category === "check");
+  let msg = `Archive ${archivable.length} item(s) to ${remote}? Each will be uploaded, verified, then deleted locally.`;
+  if (hasCheck) msg += "\\n\\n⚠️ Includes git repos — confirm no untracked/unpushed work first.";
+  if (!confirm(msg)) return;
+
+  const status = document.getElementById("scanStatus");
+  let okCount = 0, failed = [];
+  for (let i = 0; i < archivable.length; i++) {
+    const p = archivable[i];
+    status.textContent = `Archiving ${i+1}/${archivable.length}: ${p.split("/").pop()}…`;
+    status.className = "status";
+    try {
+      const r = await fetch("/cloud/archive", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({path: p, remote}),
+      });
+      const j = await r.json();
+      if (j.ok) okCount++; else failed.push({path: p, err: j.error});
+    } catch (e) {
+      failed.push({path: p, err: e.message});
+    }
+  }
+  status.textContent = `Archived ${okCount} of ${archivable.length}`;
+  status.className = okCount === archivable.length ? "status ok" : "status err";
+  if (failed.length) {
+    alert("Some failed:\\n" + failed.map(f => `${f.path}\\n  → ${f.err}`).join("\\n\\n"));
+  }
+  refreshCloud();
+  scanFolder();
+}
+
+async function restoreArchive(id) {
+  if (!confirm("Restore this archive to its original path?")) return;
+  const r = await fetch("/cloud/restore", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({id, keep_remote: true}),
+  });
+  const j = await r.json();
+  if (j.ok) {
+    alert("Restored to " + j.entry.original_path + "\\n\\nCloud copy kept as backup. Use 'Delete from cloud' to remove it.");
+  } else {
+    alert("Restore failed: " + (j.error || "unknown"));
+  }
+  refreshCloud();
+}
+
+async function deleteArchiveItem(id, name) {
+  if (!confirm(`Delete cloud copy of "${name}"?\\nThis removes the remote files AND the archive record.\\nLocal files (if any) are untouched.`)) return;
+  await fetch("/cloud?id=" + encodeURIComponent(id), { method: "DELETE" });
+  refreshCloud();
+}
+
+// --- Projects tracker ----------------------------------------------------
+let projectsCache = [];
+
+async function refreshProjects() {
+  const el = document.getElementById("projStatus");
+  el.textContent = "Loading…"; el.className = "status";
+  try {
+    const r = await fetch("/projects");
+    const j = await r.json();
+    projectsCache = j.items || [];
+    renderProjects();
+    el.textContent = "Updated " + new Date().toLocaleTimeString();
+    el.className = "status ok";
+  } catch (e) {
+    el.textContent = "Failed: " + e.message;
+    el.className = "status err";
+  }
+}
+
+function stateLabel(s) {
+  if (s === "in_progress") return '<span class="badge" style="background:#fef3c7;color:#92400e">In progress</span>';
+  if (s === "finished") return '<span class="badge" style="background:#d1fae5;color:#065f46">Finished</span>';
+  if (s === "unfinished") return '<span class="badge" style="background:#fee2e2;color:#991b1b">Unfinished</span>';
+  return `<span class="badge">${escapeHtml(s||"")}</span>`;
+}
+
+function renderProjects() {
+  const filter = document.getElementById("projFilter").value;
+  const items = projectsCache.filter(p => filter === "all" || p.state === filter);
+  document.getElementById("projCount").textContent = `(${projectsCache.length}${filter !== "all" ? " · " + items.length + " shown" : ""})`;
+  document.getElementById("projRows").innerHTML = items.length === 0
+    ? `<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:24px">${projectsCache.length === 0 ? 'No projects yet. Click "+ Add project" to track your first one.' : "No projects match this filter."}</td></tr>`
+    : items.map(p => {
+        const pathDisplay = (p.path || "").replace(/^~\//, "~/");
+        const revealable = p.path && p.path.startsWith("~/");
+        return `<tr>
+          <td><b>${escapeHtml(p.name || "")}</b></td>
+          <td><span class="desc">${escapeHtml(p.description || "")}</span></td>
+          <td>${stateLabel(p.state)}</td>
+          <td style="color:var(--muted);font-size:12px">${escapeHtml(p.last_work_date || "")}</td>
+          <td><code style="font-size:11px;color:var(--muted);word-break:break-all">${escapeHtml(pathDisplay)}</code></td>
+          <td><span class="desc">${escapeHtml(p.pending || "")}</span></td>
+          <td>
+            ${revealable ? `<button class="tiny" onclick="revealProject('${escapeHtml(p.path)}')">Open</button>` : ""}
+            <button class="tiny" onclick="editProject('${escapeHtml(p.id)}')">Edit</button>
+            <button class="tiny" onclick="deleteProject('${escapeHtml(p.id)}', '${escapeHtml(p.name || "")}')">Delete</button>
+          </td>
+        </tr>`;
+      }).join("");
+}
+
+async function revealProject(path) {
+  await fetch("/reveal?path=" + encodeURIComponent(path));
+}
+
+function openProjectModal() {
+  document.getElementById("projModalTitle").textContent = "Add project";
+  document.getElementById("projId").value = "";
+  document.getElementById("projName").value = "";
+  document.getElementById("projDesc").value = "";
+  document.getElementById("projState").value = "in_progress";
+  document.getElementById("projDate").value = new Date().toISOString().slice(0, 10);
+  document.getElementById("projPath").value = "";
+  document.getElementById("projPending").value = "";
+  document.getElementById("projModal").style.display = "flex";
+  setTimeout(() => document.getElementById("projName").focus(), 50);
+}
+
+function closeProjectModal() {
+  document.getElementById("projModal").style.display = "none";
+}
+
+function editProject(id) {
+  const p = projectsCache.find(x => x.id === id);
+  if (!p) return;
+  document.getElementById("projModalTitle").textContent = "Edit project";
+  document.getElementById("projId").value = p.id;
+  document.getElementById("projName").value = p.name || "";
+  document.getElementById("projDesc").value = p.description || "";
+  document.getElementById("projState").value = p.state || "in_progress";
+  document.getElementById("projDate").value = p.last_work_date || new Date().toISOString().slice(0, 10);
+  document.getElementById("projPath").value = p.path || "";
+  document.getElementById("projPending").value = p.pending || "";
+  document.getElementById("projModal").style.display = "flex";
+  setTimeout(() => document.getElementById("projName").focus(), 50);
+}
+
+async function saveProject(ev) {
+  ev.preventDefault();
+  const id = document.getElementById("projId").value.trim();
+  const project = {
+    name: document.getElementById("projName").value.trim(),
+    description: document.getElementById("projDesc").value.trim(),
+    state: document.getElementById("projState").value,
+    last_work_date: document.getElementById("projDate").value,
+    path: document.getElementById("projPath").value.trim(),
+    pending: document.getElementById("projPending").value.trim(),
+  };
+  if (!project.name) {
+    alert("Name is required.");
+    return;
+  }
+  const body = id
+    ? { op: "update", id, project }
+    : { op: "add", project };
+  try {
+    const r = await fetch("/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!j.ok) {
+      alert("Save failed: " + (j.error || "unknown error"));
+      return;
+    }
+    closeProjectModal();
+    refreshProjects();
+  } catch (e) {
+    alert("Save failed: " + e.message);
+  }
+}
+
+async function deleteProject(id, name) {
+  if (!confirm(`Delete project "${name}"? This only removes the tracker entry, not any files.`)) return;
+  try {
+    await fetch("/projects?id=" + encodeURIComponent(id), { method: "DELETE" });
+    refreshProjects();
+  } catch (e) {
+    alert("Delete failed: " + e.message);
+  }
+}
+
+// Close modal on Escape
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && document.getElementById("projModal")?.style.display === "flex") {
+    closeProjectModal();
+  }
+});
+
+// --- Time spent ---
+function fmtMin(m) {
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60), mm = m % 60;
+  return mm ? `${h}h ${mm}m` : `${h}h`;
+}
+async function refreshActivity() {
+  const range = document.getElementById("timeRange").value;
+  const el = document.getElementById("timeStatus");
+  el.textContent = "Loading…"; el.className = "status";
+  try {
+    const r = await fetch("/activity?range=" + encodeURIComponent(range));
+    const j = await r.json();
+    renderActivity(j);
+    el.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+    el.className = "status ok";
+  } catch (e) {
+    el.textContent = "Failed: " + e.message; el.className = "status err";
+  }
+}
+function renderActivity(j) {
+  // Banner if no activity log yet
+  const banner = document.getElementById("timeBanner");
+  if (!j.activity_log_exists) {
+    banner.style.display = "flex";
+    banner.querySelector("span").innerHTML =
+      "💡 Activity logger hasn't run yet. Once <code>com.jc.mhealth-activity</code> launchd job runs (every 60 s), app-time data will start populating. Browser & shell history are shown immediately.";
+  } else if (j.rows_collected === 0) {
+    banner.style.display = "flex";
+    banner.querySelector("span").textContent =
+      `Activity log exists but has no rows in this range yet. Pick a wider range or wait for more samples.`;
+  } else {
+    banner.style.display = "none";
+  }
+
+  document.getElementById("timeTotals").textContent =
+    j.rows_collected
+      ? `· active ${fmtMin(j.active_minutes)} · idle ${fmtMin(j.idle_minutes)} · total tracked ${fmtMin(j.total_minutes)}`
+      : "· no activity log data for this range";
+
+  const maxMin = Math.max(1, ...(j.apps || []).map(a => a.minutes));
+  const appsHtml = (j.apps || []).map(a => {
+    const w = Math.max(2, Math.round((a.minutes / maxMin) * 100));
+    return `<div style="display:grid;grid-template-columns:24px 1fr 80px 50px;gap:8px;align-items:center;padding:4px 6px">
+      <div style="height:8px;background:var(--accent);border-radius:4px;width:${w}%;justify-self:start;min-width:6px"></div>
+      <div>${escapeHtml(a.app)}</div>
+      <div style="text-align:right;font-variant-numeric:tabular-nums">${fmtMin(a.minutes)}</div>
+      <div style="text-align:right;color:var(--muted)">${a.pct}%</div>
+    </div>`;
+  }).join("");
+  document.getElementById("appTimeRows").innerHTML =
+    appsHtml || `<div style="color:var(--muted);padding:12px;text-align:center">No app-time data yet for this range.</div>`;
+
+  document.getElementById("siteRows").innerHTML =
+    (j.top_sites || []).map(s => `<tr>
+      <td>${escapeHtml(s.host)}</td>
+      <td><span class="browser-tag ${s.browser}"><span class="browser-dot ${s.browser}"></span>${s.browser}</span></td>
+      <td class="num">${s.visits}</td>
+    </tr>`).join("") || `<tr><td colspan="3" style="color:var(--muted);text-align:center">No browser history in range.</td></tr>`;
+
+  document.getElementById("cmdRows").innerHTML =
+    (j.top_commands || []).map(c => `<tr>
+      <td><code>${escapeHtml(c.command)}</code></td>
+      <td class="num">${c.count}</td>
+    </tr>`).join("") || `<tr><td colspan="2" style="color:var(--muted);text-align:center">No shell commands in range.</td></tr>`;
+}
+
+// --- Disk cleanup ---
+let diskItems = [];
+function setDiskStatus(msg, cls) {
+  const el = document.getElementById("diskStatus");
+  el.textContent = msg; el.className = "status " + (cls || "");
+}
+async function refreshDisk(force) {
+  setDiskStatus("Scanning…", "");
+  try {
+    const r = await fetch("/disk" + (force ? "?force=1" : ""));
+    const j = await r.json();
+    diskItems = j.items || [];
+    renderDisk();
+    setDiskStatus("Updated " + new Date().toLocaleTimeString(), "ok");
+  } catch (e) {
+    setDiskStatus("Scan failed: " + e.message, "err");
+  }
+}
+function renderDisk() {
+  const meta = diskItems.find(x => x._meta)?._meta || {};
+  const items = diskItems.filter(x => !x._meta);
+  const usedPct = parseInt(meta.pct || "0");
+  document.getElementById("diskSummary").innerHTML = `
+    <div><div style="font-size:11px;color:var(--muted)">Total</div><div style="font-weight:600">${meta.total_gb || "?"} GB</div></div>
+    <div><div style="font-size:11px;color:var(--muted)">Used</div><div style="font-weight:600">${meta.used_gb || "?"} GB (${meta.pct || "?"})</div></div>
+    <div><div style="font-size:11px;color:var(--muted)">Free</div><div style="font-weight:600">${meta.avail_gb || "?"} GB</div></div>
+    <div class="disk-bar"><div class="disk-bar-fill" style="width:${usedPct}%"></div></div>
+    <div><div style="font-size:11px;color:var(--muted)">Total recoverable</div><div style="font-weight:600;color:var(--ok)">${items.reduce((s,i)=>s+i.size_mb,0)} MB</div></div>
+  `;
+  if (items.length === 0) {
+    document.getElementById("diskRows").innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:24px">No cleanup candidates over 10 MB. Disk is reasonably tidy.</td></tr>`;
+    return;
+  }
+  document.getElementById("diskRows").innerHTML = items.map((it, i) => {
+    const risk = it.risk || it.level || "safe";
+    const riskBadge = riskBadgeHtml(risk);
+    const isDocker = it.action === "docker-prune";
+    const isRisky = risk === "danger" || risk === "caution";
+    const sizeDisplay = it.size_mb >= 1024 ? `${(it.size_mb/1024).toFixed(1)} GB` : `${it.size_mb} MB`;
+    const tooltip = [it.desc, it.what_breaks && ("What breaks: " + it.what_breaks), it.regen && ("Regen: " + it.regen)].filter(Boolean).join("\n\n");
+    const pathDisplay = (window.__HOME__ || window.localStorage.getItem('home') || '').length ? it.path.replace(window.__HOME__ || window.localStorage.getItem('home'), '~') : it.path;
+    const action = isDocker
+      ? `<button class="tiny" onclick="runDockerPrune()" style="background:#fed7aa;border-color:#f59e0b">Prune (safe)</button>`
+      : `<button class="tiny" onclick="cleanOne(${i})">Clean</button>`;
+    const cbDisabled = isDocker ? "disabled title='Use the Prune button, not bulk delete'" : "";
+    return `<tr data-idx="${i}" class="${isRisky ? 'risky' : ''}" title="${escapeHtml(tooltip)}">
+      <td><input type="checkbox" class="disk-cb" data-idx="${i}" onchange="onDiskSelChange(this)" ${cbDisabled}></td>
+      <td>${riskBadge}</td>
+      <td class="num"><b>${sizeDisplay}</b></td>
+      <td><span class="badge">${escapeHtml(it.category)}</span></td>
+      <td><code style="font-size:11px;color:var(--muted)">${escapeHtml(pathDisplay)}</code></td>
+      <td>
+        <div style="font-size:12px">${escapeHtml(it.desc)}</div>
+        ${it.what_breaks ? `<div style="font-size:11px;color:var(--muted);margin-top:2px"><b>What breaks:</b> ${escapeHtml(it.what_breaks)}</div>` : ""}
+        ${it.regen ? `<div style="font-size:11px;color:var(--muted)"><b>Regen:</b> ${escapeHtml(it.regen)}</div>` : ""}
+      </td>
+      <td>
+        <button class="tiny" onclick="openInFinder('${escapeHtml(it.path)}')">Reveal</button>
+        ${action}
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+function riskBadgeHtml(risk) {
+  if (risk === "danger") return '<span title="DANGER — contains user state, not just cache" style="display:inline-block;padding:2px 6px;border-radius:4px;background:#fee2e2;color:#991b1b;font-size:10px;font-weight:600">🔴 DANGER</span>';
+  if (risk === "caution") return '<span title="CAUTION — safe but app may need restart or slow regen" style="display:inline-block;padding:2px 6px;border-radius:4px;background:#fef3c7;color:#92400e;font-size:10px;font-weight:600">🟡 CAUTION</span>';
+  return '<span title="SAFE — regenerable from public sources, no app impact" style="display:inline-block;padding:2px 6px;border-radius:4px;background:#d1fae5;color:#065f46;font-size:10px;font-weight:600">🟢 SAFE</span>';
+}
+
+async function runDockerPrune() {
+  if (!confirm("Run 'docker system prune -f'?\n\nThis removes:\n  • Stopped containers\n  • Dangling images\n  • Unused build cache\n\nThis KEEPS:\n  • Running containers\n  • Used images\n  • All NAMED VOLUMES (your databases stay safe)\n\nFor 'docker system prune -a' (also removes UNUSED images), confirm below then click Run again.")) return;
+  setDiskStatus("Running docker prune…", "");
+  try {
+    const r = await fetch("/disk/docker-prune", { method: "POST",
+      headers: {"Content-Type":"application/json"}, body: JSON.stringify({deep: false}) });
+    const j = await r.json();
+    if (j.ok) {
+      alert("docker prune completed:\n\n" + (j.stdout || "(no output)"));
+      setDiskStatus("Pruned", "ok");
+      setTimeout(() => refreshDisk(true), 800);
+    } else {
+      alert("docker prune failed: " + (j.error || j.stderr));
+      setDiskStatus("Failed", "err");
+    }
+  } catch (e) {
+    alert("Failed: " + e.message);
+    setDiskStatus("Failed", "err");
+  }
+}
+function onDiskSelChange(cb) { cb.closest("tr").classList.toggle("selected", cb.checked); }
+function toggleAllDisk() {
+  const all = document.getElementById("diskSelAll").checked;
+  document.querySelectorAll("#diskRows .disk-cb").forEach(cb => {
+    cb.checked = all; cb.closest("tr").classList.toggle("selected", all);
+  });
+}
+async function openInFinder(path) {
+  await fetch("/reveal?path=" + encodeURIComponent(path)).catch(() => {});
+}
+async function cleanOne(idx) {
+  const item = diskItems.filter(x => !x._meta)[idx];
+  if (!item) return;
+  if (!confirm(`Delete contents of:\n\n${item.path}\n\n(${item.size_mb} MB) — ${item.desc}\n\nThis is permanent.`)) return;
+  await doCleanRequest([item]);
+}
+async function cleanSelectedDisk() {
+  const real = diskItems.filter(x => !x._meta);
+  const items = [...document.querySelectorAll("#diskRows .disk-cb:checked")]
+    .map(cb => real[parseInt(cb.dataset.idx)]).filter(Boolean);
+  if (items.length === 0) { setDiskStatus("Nothing selected", "err"); return; }
+  const total = items.reduce((s, x) => s + x.size_mb, 0);
+  const lines = items.slice(0, 8).map(x => `  ${x.size_mb} MB  ${x.path.split('/').pop()}`).join("\n");
+  if (!confirm(`Clean ${items.length} item(s) — ~${total} MB total?\n\n${lines}${items.length>8?'\n  …':''}\n\nDeletion is permanent.`)) return;
+  await doCleanRequest(items);
+}
+async function doCleanRequest(items) {
+  setDiskStatus("Cleaning…", "");
+  try {
+    const r = await fetch("/disk-clean", { method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({paths: items.map(x => ({path: x.path, action: x.action}))}) });
+    const j = await r.json();
+    const ok = j.results.filter(r => r.ok).length;
+    const fail = j.results.filter(r => !r.ok).length;
+    setDiskStatus(`Cleaned ${ok}${fail ? `, ${fail} failed` : ""}`, fail ? "err" : "ok");
+    setTimeout(() => refreshDisk(true), 800);
+  } catch (e) {
+    setDiskStatus("Clean failed: " + e.message, "err");
+  }
+}
+
+// --- Column resizing (with localStorage persistence per table) ---
+function makeColumnsResizable(tableId) {
+  const table = document.getElementById(tableId);
+  if (!table) return;
+  const cols = table.querySelectorAll("colgroup col");
+  if (!cols.length) return;
+  // Restore saved widths
+  try {
+    const saved = JSON.parse(localStorage.getItem("colw_" + tableId) || "[]");
+    saved.forEach((w, i) => { if (cols[i] && w) cols[i].style.width = w + "px"; });
+  } catch {}
+  const ths = table.querySelectorAll("thead th");
+  ths.forEach((th, idx) => {
+    // Don't add a resizer to the last column
+    if (idx >= cols.length - 1) return;
+    if (th.querySelector(".col-resizer")) return; // already added
+    const h = document.createElement("div");
+    h.className = "col-resizer";
+    th.appendChild(h);
+    h.addEventListener("mousedown", e => {
+      e.preventDefault(); e.stopPropagation();
+      const startX = e.pageX;
+      const col = cols[idx];
+      const startW = col.offsetWidth || parseFloat(col.style.width) || 100;
+      h.classList.add("dragging");
+      document.body.classList.add("col-resizing");
+      function onMove(ev) {
+        const newW = Math.max(30, startW + (ev.pageX - startX));
+        col.style.width = newW + "px";
+      }
+      function onUp() {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        h.classList.remove("dragging");
+        document.body.classList.remove("col-resizing");
+        // Persist widths
+        const widths = [...cols].map(c => c.offsetWidth);
+        localStorage.setItem("colw_" + tableId, JSON.stringify(widths));
+      }
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
+  });
+}
+
+// Run after first render lays down the headers
+const _origRender = render;
+render = function() {
+  _origRender();
+  makeColumnsResizable("procTable");
+  makeColumnsResizable("tabTable");
+};
+
+refresh();
+startHeartbeat();
+</script>
+</body>
+</html>
+"""
+
+# --- Server -------------------------------------------------------------
+
+LAST_PING = time.time()
+SHUTDOWN = threading.Event()
+IDLE_TIMEOUT = 600  # only used when started without --service
+
+# Caches so /kill doesn't re-run a 2s ps+osascript chain
+_PROC_CACHE: dict[str, Any] = {"procs": [], "ts": 0.0}
+_TAB_CACHE: dict[str, Any] = {"tabs": [], "ts": 0.0}
+_DISK_CACHE: dict[str, Any] = {"items": None, "ts": 0.0}
+_CACHE_LOCK = threading.Lock()
+_PROC_TTL = 4.0
+_TAB_TTL = 15.0  # heap correlation is slow — refresh less often
+_DISK_TTL = 120.0  # disk scan is slow — cache for 2 min
+
+
+def cached_disk(force: bool = False) -> list[dict]:
+    with _CACHE_LOCK:
+        fresh = (time.time() - _DISK_CACHE["ts"] < _DISK_TTL) and _DISK_CACHE["items"] is not None
+        if fresh and not force:
+            return _DISK_CACHE["items"]
+    items = scan_disk()
+    with _CACHE_LOCK:
+        _DISK_CACHE["items"] = items
+        _DISK_CACHE["ts"] = time.time()
+    return items
+
+
+def cached_processes(force: bool = False) -> list[dict]:
+    with _CACHE_LOCK:
+        fresh = time.time() - _PROC_CACHE["ts"] < _PROC_TTL
+        if fresh and not force and _PROC_CACHE["procs"]:
+            return _PROC_CACHE["procs"]
+    procs = get_processes()
+    with _CACHE_LOCK:
+        _PROC_CACHE["procs"] = procs
+        _PROC_CACHE["ts"] = time.time()
+    return procs
+
+
+def cached_tabs_fast() -> list[dict]:
+    """Return tabs immediately. Uses cached heap data if available, otherwise
+    fetches just titles+URLs (no heap — fast path)."""
+    with _CACHE_LOCK:
+        cached = _TAB_CACHE.get("tabs", [])
+        ts = _TAB_CACHE.get("ts", 0)
+    if cached and time.time() - ts < 60:
+        return cached
+    return get_browser_tabs(with_heap=False)
+
+
+def heap_updater_loop() -> None:
+    """Background thread: keeps _TAB_CACHE warm with heap data so /data is fast.
+    Each iteration may take minutes — never blocks the request path."""
+    if SHUTDOWN.wait(2):
+        return
+    while not SHUTDOWN.is_set():
+        try:
+            tabs = get_browser_tabs(with_heap=True)
+            with _CACHE_LOCK:
+                _TAB_CACHE["tabs"] = tabs
+                _TAB_CACHE["ts"] = time.time()
+        except Exception:
+            pass
+        if SHUTDOWN.wait(30):
+            return
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def _send(self, code: int, body: bytes, content_type: str = "text/html") -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        global LAST_PING
+        LAST_PING = time.time()
+        if self.path == "/":
+            self._send(200, HTML.encode())
+        elif self.path == "/data":
+            payload = json.dumps({
+                "procs": cached_processes(force=True),
+                "tabs": cached_tabs_fast(),
+                "summary": system_summary(),
+            }).encode()
+            self._send(200, payload, "application/json")
+        elif self.path == "/disk":
+            payload = json.dumps({"items": cached_disk(force=False)}).encode()
+            self._send(200, payload, "application/json")
+        elif self.path.startswith("/disk?"):
+            force = "force=1" in self.path or "refresh=1" in self.path
+            payload = json.dumps({"items": cached_disk(force=force)}).encode()
+            self._send(200, payload, "application/json")
+        elif self.path.startswith("/activity"):
+            from urllib.parse import urlparse, parse_qs
+            params = parse_qs(urlparse(self.path).query)
+            range_key = params.get("range", ["today"])[0]
+            payload = json.dumps(time_spent_summary(range_key)).encode()
+            self._send(200, payload, "application/json")
+        elif self.path == "/readlater":
+            payload = json.dumps({"items": _readlater_load()}).encode()
+            self._send(200, payload, "application/json")
+        elif self.path == "/projects":
+            payload = json.dumps({"items": _projects_ensure_seeded()}).encode()
+            self._send(200, payload, "application/json")
+        elif self.path == "/cloud":
+            remotes = []
+            for r in rclone_remotes():
+                about = rclone_about(r["name"])
+                remotes.append({
+                    "name": r["name"], "type": r["type"],
+                    "total": about.get("total"), "used": about.get("used"), "free": about.get("free"),
+                })
+            payload = json.dumps({
+                "rclone_available": rclone_available(),
+                "rclone_path": _which_rclone(),
+                "remotes": remotes,
+                "archives": _archives_load(),
+            }).encode()
+            self._send(200, payload, "application/json")
+        elif self.path.startswith("/cloud/scan"):
+            from urllib.parse import urlparse, parse_qs
+            params = parse_qs(urlparse(self.path).query)
+            tgt = params.get("path", [""])[0]
+            if not tgt:
+                self._send(400, b'{"ok":false,"error":"path required"}', "application/json")
+                return
+            # Multi-path: accept comma-separated; classify each and merge
+            paths = [p.strip() for p in tgt.split(",") if p.strip()]
+            if len(paths) == 1:
+                result = classify_folder(paths[0])
+            else:
+                # Merge results — items prefixed with the parent path so they sort sensibly
+                merged_items = []
+                merged_totals = {"delete": 0, "archive": 0, "keep": 0, "check": 0}
+                ok = True
+                errors = []
+                for p in paths:
+                    r = classify_folder(p)
+                    if not r.get("ok"):
+                        ok = False
+                        errors.append({"path": p, "error": r.get("error")})
+                        continue
+                    for it in r["items"]:
+                        it["scan_root"] = r["target"]
+                        merged_items.append(it)
+                    for k, v in r["totals_bytes"].items():
+                        merged_totals[k] = merged_totals.get(k, 0) + v
+                result = {"ok": ok, "target": tgt, "items": merged_items,
+                          "totals_bytes": merged_totals, "errors": errors}
+            self._send(200, json.dumps(result).encode(), "application/json")
+        elif self.path == "/cloud/home-overview":
+            self._send(200, json.dumps(scan_home_overview()).encode(), "application/json")
+        elif self.path == "/cloud/pick-folder":
+            self._send(200, json.dumps(pick_folder()).encode(), "application/json")
+        elif self.path == "/snooze":
+            self._send(200, json.dumps(snooze_status()).encode(), "application/json")
+        elif self.path == "/ping":
+            self._send(200, b"ok", "text/plain")
+        elif self.path.startswith("/reveal?"):
+            from urllib.parse import urlparse, parse_qs
+            params = parse_qs(urlparse(self.path).query)
+            target = params.get("path", [""])[0]
+            # Only reveal if path is in whitelist (under $HOME). Expand "~/" first.
+            ok, _ = (False, "")
+            if target:
+                home = os.path.expanduser("~")
+                expanded = os.path.expanduser(target)
+                if expanded.startswith(home + os.sep) or expanded == home:
+                    try:
+                        # If it's a directory, open it; if a file, reveal it.
+                        if os.path.isdir(expanded):
+                            subprocess.Popen(["open", expanded])
+                        else:
+                            subprocess.Popen(["open", "-R", expanded])
+                        ok = True
+                    except Exception:
+                        pass
+            self._send(200, json.dumps({"ok": ok}).encode(), "application/json")
+        else:
+            self._send(404, b"not found", "text/plain")
+
+    def do_POST(self) -> None:
+        global LAST_PING
+        LAST_PING = time.time()
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode() if length else ""
+
+        if self.path == "/kill":
+            try:
+                pids = json.loads(body).get("pids", [])
+            except Exception:
+                pids = []
+            # Server-side defense: refuse to kill critical processes even if
+            # the client somehow asks. Use the cached process list — calling
+            # get_processes() here adds 1-3 s of latency to the kill response.
+            current = {p["pid"]: p for p in cached_processes(force=False)}
+            killed, failed, blocked = 0, 0, 0
+            for pid in pids:
+                try:
+                    p = int(pid)
+                except (TypeError, ValueError):
+                    failed += 1
+                    continue
+                info = current.get(p)
+                if info and info.get("level") == "critical":
+                    blocked += 1
+                    continue
+                if p == 1 or p == os.getpid():
+                    blocked += 1
+                    continue
+                try:
+                    os.kill(p, signal.SIGTERM)
+                    killed += 1
+                except ProcessLookupError:
+                    killed += 1
+                except PermissionError:
+                    try:
+                        os.kill(p, signal.SIGKILL)
+                        killed += 1
+                    except Exception:
+                        failed += 1
+                except Exception:
+                    failed += 1
+            try:
+                subprocess.Popen([
+                    "terminal-notifier", "-title", "Mac Health",
+                    "-subtitle", f"Killed {killed} process(es)",
+                    "-message", f"{failed} failed" if failed else "OK",
+                    "-sound", "Glass", "-group", "mac-health-watcher",
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except FileNotFoundError:
+                pass
+            self._send(200, json.dumps({"killed": killed, "failed": failed, "blocked": blocked}).encode(),
+                       "application/json")
+
+        elif self.path == "/close-tab":
+            # Body shape: {"items": [{"app":"Google Chrome","window":1,"tab":2}, ...]}
+            try:
+                items = json.loads(body).get("items", [])
+            except Exception:
+                items = []
+            by_app: dict[str, list[tuple[int, int]]] = {}
+            for it in items:
+                try:
+                    app = str(it["app"])
+                    by_app.setdefault(app, []).append((int(it["window"]), int(it["tab"])))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            closed = 0
+            for app, pairs in by_app.items():
+                pairs.sort(reverse=True)
+                for w, t in pairs:
+                    if close_browser_tab(app, w, t):
+                        closed += 1
+            # Invalidate tab cache so next /data fetches fresh — closed tabs
+            # disappear immediately rather than lingering for 60 s
+            with _CACHE_LOCK:
+                _TAB_CACHE["ts"] = 0.0
+            self._send(200, json.dumps({"closed": closed}).encode(), "application/json")
+
+        elif self.path == "/disk-clean":
+            try:
+                payload = json.loads(body)
+                paths = payload.get("paths", [])
+            except Exception:
+                paths = []
+            results = []
+            for p in paths:
+                path = p.get("path", "")
+                action = p.get("action", "delete-contents")
+                ok, msg = clean_path(path, action)
+                results.append({"path": path, "ok": ok, "msg": msg})
+            # Invalidate disk cache so next /disk shows updated sizes
+            with _CACHE_LOCK:
+                _DISK_CACHE["ts"] = 0.0
+            self._send(200, json.dumps({"results": results}).encode(), "application/json")
+
+        elif self.path == "/focus-tab":
+            try:
+                d = json.loads(body)
+                ok = focus_browser_tab(d["app"], int(d["window"]), int(d["tab"]))
+            except Exception:
+                ok = False
+            self._send(200, json.dumps({"ok": ok}).encode(), "application/json")
+
+        elif self.path == "/kill-orphan-servers":
+            # Find all other Python processes running mhealth-kill and SIGTERM them.
+            mypid = os.getpid()
+            killed = 0
+            try:
+                cmd = subprocess.run(
+                    ["ps", "-Aww", "-o", "pid=,command="],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout
+                for line in cmd.splitlines():
+                    line = line.strip()
+                    sp = line.find(" ")
+                    if sp <= 0:
+                        continue
+                    try:
+                        p = int(line[:sp])
+                    except ValueError:
+                        continue
+                    cmdline = line[sp + 1:]
+                    if p == mypid or p == 1:
+                        continue
+                    if "mhealth-kill" in cmdline and "python" in cmdline.lower():
+                        try:
+                            os.kill(p, signal.SIGTERM)
+                            killed += 1
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            self._send(200, json.dumps({"killed": killed}).encode(), "application/json")
+
+        elif self.path == "/readlater":
+            try:
+                items = json.loads(body).get("items", [])
+            except Exception:
+                items = []
+            added = readlater_add(items if isinstance(items, list) else [])
+            self._send(200, json.dumps({"added": added}).encode(), "application/json")
+
+        elif self.path == "/projects":
+            try:
+                payload_in = json.loads(body) if body else {}
+            except Exception:
+                payload_in = {}
+            op = (payload_in.get("op") or "").strip()
+            try:
+                if op == "add":
+                    entry = projects_add(payload_in.get("project") or {})
+                    self._send(200, json.dumps({"ok": True, "project": entry}).encode(), "application/json")
+                elif op == "update":
+                    iid = (payload_in.get("id") or "").strip()
+                    entry = projects_update(iid, payload_in.get("project") or {})
+                    if entry is None:
+                        self._send(404, json.dumps({"ok": False, "error": "not found"}).encode(), "application/json")
+                    else:
+                        self._send(200, json.dumps({"ok": True, "project": entry}).encode(), "application/json")
+                else:
+                    self._send(400, json.dumps({"ok": False, "error": "unknown op"}).encode(), "application/json")
+            except ValueError as ve:
+                self._send(400, json.dumps({"ok": False, "error": str(ve)}).encode(), "application/json")
+
+        elif self.path == "/cloud/archive":
+            try:
+                payload_in = json.loads(body)
+            except Exception:
+                self._send(400, b'{"ok":false,"error":"invalid json"}', "application/json"); return
+            path = (payload_in.get("path") or "").strip()
+            remote = (payload_in.get("remote") or "").strip()
+            if not path or not remote:
+                self._send(400, b'{"ok":false,"error":"path and remote required"}', "application/json"); return
+            # Long-running — rclone copy of GBs can take minutes/hours
+            result = archive_path_to_cloud(path, remote)
+            self._send(200 if result.get("ok") else 500, json.dumps(result).encode(), "application/json")
+
+        elif self.path == "/cloud/restore":
+            try:
+                payload_in = json.loads(body)
+            except Exception:
+                self._send(400, b'{"ok":false,"error":"invalid json"}', "application/json"); return
+            iid = (payload_in.get("id") or "").strip()
+            keep_remote = bool(payload_in.get("keep_remote", True))
+            result = restore_archive(iid, keep_remote=keep_remote)
+            self._send(200 if result.get("ok") else 400, json.dumps(result).encode(), "application/json")
+
+        elif self.path == "/snooze":
+            try:
+                payload_in = json.loads(body) if body else {}
+            except Exception:
+                payload_in = {}
+            secs = int(payload_in.get("seconds", 0))
+            self._send(200, json.dumps(snooze_set(secs)).encode(), "application/json")
+
+        elif self.path == "/disk/docker-prune":
+            try:
+                payload_in = json.loads(body) if body else {}
+            except Exception:
+                payload_in = {}
+            deep = bool(payload_in.get("deep", False))
+            result = docker_prune(deep=deep)
+            self._send(200 if result.get("ok") else 500, json.dumps(result).encode(), "application/json")
+
+        elif self.path == "/cloud/delete-bulk":
+            # Bulk-delete items from the classifier "delete" category
+            try:
+                payload_in = json.loads(body)
+            except Exception:
+                self._send(400, b'{"ok":false,"error":"invalid json"}', "application/json"); return
+            paths = payload_in.get("paths") or []
+            home = os.path.expanduser("~")
+            deleted, failed, skipped = 0, [], []
+            for p in paths:
+                p = os.path.expanduser(p)
+                if not (p.startswith(home + os.sep)):
+                    skipped.append(p); continue
+                try:
+                    if os.path.isdir(p) and not os.path.islink(p):
+                        import shutil
+                        shutil.rmtree(p)
+                    else:
+                        os.remove(p)
+                    deleted += 1
+                except Exception as e:
+                    failed.append({"path": p, "error": str(e)})
+            self._send(200, json.dumps({"ok": True, "deleted": deleted, "failed": failed, "skipped": skipped}).encode(), "application/json")
+
+        elif self.path == "/quit":
+            self._send(200, b"bye", "text/plain")
+            threading.Timer(0.5, lambda: SHUTDOWN.set()).start()
+        else:
+            self._send(404, b"not found", "text/plain")
+
+    def do_DELETE(self) -> None:
+        global LAST_PING
+        LAST_PING = time.time()
+        from urllib.parse import urlparse, parse_qs
+        u = urlparse(self.path)
+        if u.path == "/readlater":
+            params = parse_qs(u.query)
+            iid = params.get("id", [""])[0]
+            ok = readlater_remove(iid)
+            self._send(200, json.dumps({"ok": ok}).encode(), "application/json")
+        elif u.path == "/projects":
+            params = parse_qs(u.query)
+            iid = params.get("id", [""])[0]
+            ok = projects_remove(iid)
+            self._send(200, json.dumps({"ok": ok}).encode(), "application/json")
+        elif u.path == "/cloud":
+            params = parse_qs(u.query)
+            iid = params.get("id", [""])[0]
+            result = delete_archive(iid)
+            self._send(200, json.dumps(result).encode(), "application/json")
+        else:
+            self._send(404, b"not found", "text/plain")
+
+    def log_message(self, *args: Any) -> None:
+        pass
+
+
+STABLE_PORT_RANGE = range(8765, 8775)
+
+
+def find_free_port() -> int:
+    """Prefer the stable port range (8765-8774) so bookmarks stay valid.
+    Sets SO_REUSEADDR on the test socket so we can rebind ports that just
+    closed (TIME_WAIT)."""
+    for p in STABLE_PORT_RANGE:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", p))
+            s.close()
+            return p
+        except OSError:
+            try: s.close()
+            except Exception: pass
+            continue
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+def already_running_url() -> str | None:
+    """If an mhealth-kill server is already on the stable range, return its URL.
+    Caller should just open the browser to that URL instead of starting another."""
+    import urllib.request
+    for p in STABLE_PORT_RANGE:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{p}/ping", timeout=0.3) as r:
+                if r.read(8).startswith(b"ok"):
+                    return f"http://127.0.0.1:{p}/"
+        except Exception:
+            continue
+    return None
+
+
+def focus_existing_tab(url: str) -> bool:
+    """If any open Chrome/Brave tab matches this URL, activate it and bring the
+    browser to the front. Returns True if found. Avoids opening duplicate tabs."""
+    # Match by host:port prefix, since the URL might or might not have a path
+    from urllib.parse import urlparse
+    u = urlparse(url)
+    target_prefix = f"{u.scheme}://{u.netloc}"
+    for app_name in ("Google Chrome", "Brave Browser"):
+        if subprocess.run(["pgrep", "-x", app_name], capture_output=True).returncode != 0:
+            continue
+        script = (
+            f'tell application "{app_name}"\n'
+            'set out to ""\n'
+            'set wn to 0\n'
+            'repeat with w in windows\n'
+            '  set wn to wn + 1\n'
+            '  set tn to 0\n'
+            '  repeat with t in tabs of w\n'
+            '    set tn to tn + 1\n'
+            '    try\n'
+            f'      if URL of t starts with "{target_prefix}" then\n'
+            '        set active tab index of w to tn\n'
+            '        set index of w to 1\n'
+            '        activate\n'
+            '        return "1"\n'
+            '      end if\n'
+            '    end try\n'
+            '  end repeat\n'
+            'end repeat\n'
+            'return ""\n'
+            'end tell\n'
+        )
+        try:
+            r = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=5)
+            if r.stdout.strip() == "1":
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def open_or_focus(url: str) -> None:
+    """Focus an existing tab if any browser has it; otherwise open a new tab."""
+    if focus_existing_tab(url):
+        return
+    webbrowser.open(url)
+
+
+def idle_watcher(server: http.server.HTTPServer) -> None:
+    while not SHUTDOWN.wait(30):
+        if time.time() - LAST_PING > IDLE_TIMEOUT:
+            print(f"Idle for >{IDLE_TIMEOUT}s, shutting down.", file=sys.stderr)
+            SHUTDOWN.set()
+    server.shutdown()
+
+
+def main() -> int:
+    # CLI flags:
+    #   --service     run forever (launchd-managed); no browser pop, no idle timeout
+    #   --no-browser  start the server but don't open a tab
+    args = sys.argv[1:]
+    service_mode = "--service" in args
+    no_browser = service_mode or "--no-browser" in args
+
+    # If a server is already running on the stable range, just focus the tab.
+    # Skip this check in service mode (we ARE the server).
+    if not service_mode:
+        existing = already_running_url()
+        if existing:
+            print(f"mhealth-kill already running at {existing}", file=sys.stderr)
+            if not no_browser:
+                open_or_focus(existing)
+            return 0
+
+    port = find_free_port()
+    http.server.ThreadingHTTPServer.allow_reuse_address = True
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    if not service_mode:
+        # idle-shutdown only when invoked manually; service mode runs forever
+        threading.Thread(target=idle_watcher, args=(server,), daemon=True).start()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=heap_updater_loop, daemon=True).start()
+    url = f"http://127.0.0.1:{port}/"
+    print(f"mhealth-kill server: {url}", file=sys.stderr)
+    if not no_browser:
+        open_or_focus(url)
+    try:
+        SHUTDOWN.wait()
+    except KeyboardInterrupt:
+        pass
+    server.shutdown()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

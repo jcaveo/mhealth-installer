@@ -1,0 +1,197 @@
+#!/bin/bash
+# mac-health-watcher
+# Periodic system health check. On problems, posts a macOS notification whose
+# "Show" button opens a detailed diagnostic snapshot in TextEdit.
+#
+# Manual: ~/bin/mac-health-watcher [-v]
+
+set -u
+
+LOG="$HOME/Library/Logs/mac-health-watcher.log"
+SNAPSHOT="$HOME/Library/Logs/mac-health-snapshot.txt"
+STATE_DIR="$HOME/Library/Application Support/mac-health-watcher"
+STATE="$STATE_DIR/last-alert"
+mkdir -p "$STATE_DIR"
+[ -f "$STATE" ] || echo 0 > "$STATE"
+
+VERBOSE=0
+[ "${1:-}" = "-v" ] && VERBOSE=1
+
+now=$(date +%s)
+last_alert=$(cat "$STATE" 2>/dev/null || echo 0)
+COOLDOWN=900
+
+PAGE_SIZE=$(vm_stat | head -1 | awk '{print $8}')
+[ -z "$PAGE_SIZE" ] && PAGE_SIZE=16384
+
+NCPU=$(sysctl -n hw.ncpu)
+# These detect anomalies (logged) — but a notification ONLY fires when the
+# situation is genuinely degrading the system (see SEVERE block below).
+LOAD_THRESHOLD=$((NCPU * 3))
+FREE_RAM_MIN_MB=500
+COMPRESSOR_MAX_MB=4000
+SWAP_MAX_MB=5000
+DISK_MAX_PCT=92         # was 90 — too noisy; macOS handles 80-92% fine
+CLAUDE_MAX=15           # was 10 — most heavy users have a few sessions
+
+alerts=()
+
+load=$(uptime | sed -E 's/.*load averages?: //' | awk '{print $1}' | tr -d ',')
+load_int=${load%.*}
+[ -z "$load_int" ] && load_int=0
+[ "$load_int" -gt "$LOAD_THRESHOLD" ] && alerts+=("Load avg ${load} (threshold ${LOAD_THRESHOLD} for ${NCPU}-core)")
+
+unused_pages=$(vm_stat | awk '/Pages free/ {gsub("\\.",""); print $3}')
+unused_mb=$((unused_pages * PAGE_SIZE / 1024 / 1024))
+[ "$unused_mb" -lt "$FREE_RAM_MIN_MB" ] && alerts+=("Free RAM only ${unused_mb}MB")
+
+compressor_pages=$(vm_stat | awk '/Pages occupied by compressor/ {gsub("\\.",""); print $5}')
+compressor_mb=$((compressor_pages * PAGE_SIZE / 1024 / 1024))
+[ "$compressor_mb" -gt "$COMPRESSOR_MAX_MB" ] && alerts+=("Memory compressor at ${compressor_mb}MB (heavy RAM pressure)")
+
+swap_used_mb=$(sysctl -n vm.swapusage | awk '{for(i=1;i<=NF;i++) if($i=="used"){print $(i+2); exit}}' | sed 's/M//' | cut -d. -f1)
+[ -z "$swap_used_mb" ] && swap_used_mb=0
+[ "$swap_used_mb" -gt "$SWAP_MAX_MB" ] && alerts+=("Swap usage ${swap_used_mb}MB")
+
+data_pct=$(df /System/Volumes/Data 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%')
+[ -z "$data_pct" ] && data_pct=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
+data_avail=$(df -h /System/Volumes/Data 2>/dev/null | awk 'NR==2 {print $4}')
+[ "$data_pct" -gt "$DISK_MAX_PCT" ] && alerts+=("Disk ${data_pct}% full (${data_avail} free)")
+
+claude_count=$(pgrep -x claude | wc -l | tr -d ' ')
+claude_rss_mb=$(ps -Aceo rss,comm | awk '$2=="claude" {sum+=$1} END {print int(sum/1024)}')
+[ "$claude_count" -gt "$CLAUDE_MAX" ] && alerts+=("${claude_count} Claude processes using ~${claude_rss_mb}MB RAM")
+
+top_ram=$(ps -Aceo pid,rss,comm -m | awk 'NR==2 {printf "%s (%dMB)", $3, $2/1024}')
+top_cpu=$(ps -Aceo pid,pcpu,comm -r | awk 'NR==2 {printf "%s (%s%%)", $3, $2}')
+
+# Always log
+log_line="[$(date '+%Y-%m-%d %H:%M:%S')] load=${load} freeMB=${unused_mb} compMB=${compressor_mb} swapMB=${swap_used_mb} disk=${data_pct}% claudes=${claude_count} topRAM=${top_ram} topCPU=${top_cpu} alerts=${#alerts[@]}"
+echo "$log_line" >> "$LOG"
+[ "$VERBOSE" = "1" ] && echo "$log_line"
+
+# Always regenerate the snapshot so 'Show' opens current data
+{
+  echo "================================================================"
+  echo "  MAC HEALTH SNAPSHOT — $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "================================================================"
+  echo ""
+  if [ "${#alerts[@]}" -gt 0 ]; then
+    echo "ALERTS (${#alerts[@]}):"
+    for a in "${alerts[@]}"; do echo "   ! $a"; done
+  else
+    echo "STATUS: all metrics within thresholds"
+  fi
+  echo ""
+  echo "----------------------------------------------------------------"
+  echo "CURRENT METRICS"
+  echo "----------------------------------------------------------------"
+  printf "  Load avg (1/5/15 min): %s   |   threshold for alert: > %d\n" "$(uptime | sed -E 's/.*load averages?: //')" "$LOAD_THRESHOLD"
+  printf "  Free RAM:              %d MB   |   threshold: < %d MB\n" "$unused_mb" "$FREE_RAM_MIN_MB"
+  printf "  Memory compressor:     %d MB   |   threshold: > %d MB\n" "$compressor_mb" "$COMPRESSOR_MAX_MB"
+  printf "  Swap usage:            %d MB   |   threshold: > %d MB\n" "$swap_used_mb" "$SWAP_MAX_MB"
+  printf "  Disk usage:            %s%% (%s free)   |   threshold: > %d%%\n" "$data_pct" "$data_avail" "$DISK_MAX_PCT"
+  printf "  Claude processes:      %d (using ~%d MB)   |   threshold: > %d\n" "$claude_count" "$claude_rss_mb" "$CLAUDE_MAX"
+  echo ""
+  echo "----------------------------------------------------------------"
+  echo "TOP 10 PROCESSES BY RAM"
+  echo "----------------------------------------------------------------"
+  printf "  %6s  %8s  %5s  %s\n" "PID" "RAM" "CPU%" "PROCESS"
+  ps -Aceo pid,rss,pcpu,comm -m | awk 'NR>1 && NR<=11 {printf "  %6s  %5dMB  %5s  %s\n", $1, $2/1024, $3, $4}'
+  echo ""
+  echo "----------------------------------------------------------------"
+  echo "TOP 10 PROCESSES BY CPU"
+  echo "----------------------------------------------------------------"
+  printf "  %6s  %8s  %5s  %s\n" "PID" "RAM" "CPU%" "PROCESS"
+  ps -Aceo pid,rss,pcpu,comm -r | awk 'NR>1 && NR<=11 {printf "  %6s  %5dMB  %5s  %s\n", $1, $2/1024, $3, $4}'
+  echo ""
+  echo "----------------------------------------------------------------"
+  echo "DISK USAGE BY VOLUME"
+  echo "----------------------------------------------------------------"
+  df -h | awk 'NR==1 || /\/System\/Volumes\/Data/ || /^\/dev\/disk/ {print "  "$0}'
+  echo ""
+  echo "----------------------------------------------------------------"
+  echo "QUICK ACTIONS YOU CAN RUN"
+  echo "----------------------------------------------------------------"
+  if [ "$claude_count" -gt "$CLAUDE_MAX" ]; then
+    echo "  - Many Claude processes — kill them all (incl. your active session):"
+    echo "      pkill -9 -x claude"
+  fi
+  if [ "$unused_mb" -lt "$FREE_RAM_MIN_MB" ] || [ "$compressor_mb" -gt "$COMPRESSOR_MAX_MB" ]; then
+    echo "  - RAM pressure — quit the top-RAM processes above, or restart"
+  fi
+  if [ "$data_pct" -gt "$DISK_MAX_PCT" ]; then
+    echo "  - Disk almost full — biggest cache and trash candidates:"
+    echo "      du -sh ~/Library/Caches/* | sort -h | tail -10"
+    echo "      rm -rf ~/.Trash/*"
+    echo "      docker system prune -a --volumes"
+  fi
+  if [ "$swap_used_mb" -gt "$SWAP_MAX_MB" ]; then
+    echo "  - Heavy swap — reboot to clear, then watch which processes drive it back up"
+  fi
+  echo ""
+  echo "----------------------------------------------------------------"
+  echo "RECENT WATCHER LOG (last 10 runs)"
+  echo "----------------------------------------------------------------"
+  tail -10 "$LOG" | sed 's/^/  /'
+  echo ""
+  echo "(Watcher runs every 5 minutes. Log: $LOG)"
+} > "$SNAPSHOT"
+
+# Determine SEVERE state — only notify when system is genuinely degrading.
+# Single threshold breaches (e.g., disk 91%) get logged but don't ping.
+severe=0
+severe_reason=""
+if [ "$unused_mb" -lt 100 ]; then
+  severe=1; severe_reason="Free RAM exhausted (${unused_mb} MB)"
+elif [ "$compressor_mb" -gt 6000 ] && [ "$swap_used_mb" -gt 4000 ]; then
+  severe=1; severe_reason="Memory exhaustion (compressor ${compressor_mb} MB + swap ${swap_used_mb} MB)"
+elif [ "$swap_used_mb" -gt 8000 ]; then
+  severe=1; severe_reason="Heavy swap thrashing (${swap_used_mb} MB)"
+elif [ "$load_int" -gt 20 ] && [ "$unused_mb" -lt 300 ]; then
+  severe=1; severe_reason="High load (${load}) under RAM pressure"
+elif [ "${#alerts[@]}" -ge 3 ]; then
+  severe=1; severe_reason="Multiple compounding pressures (${#alerts[@]} thresholds breached)"
+fi
+
+# Check snooze — file contains an absolute epoch timestamp. If now < snoozed_until, suppress.
+SNOOZE_FILE="$STATE_DIR/snoozed-until"
+snoozed_until=0
+if [ -f "$SNOOZE_FILE" ]; then
+  snoozed_until=$(cat "$SNOOZE_FILE" 2>/dev/null || echo 0)
+fi
+
+# Notify only on SEVERE (or in verbose/manual mode), and only if not snoozed
+if { [ "$severe" = "1" ] || [ "$VERBOSE" = "1" ]; } && [ "$now" -ge "$snoozed_until" ]; then
+  elapsed=$((now - last_alert))
+  if [ "$elapsed" -ge "$COOLDOWN" ] || [ "$VERBOSE" = "1" ]; then
+    body=$(printf '%s\n' "${alerts[@]}")
+
+    # Use absolute paths — launchd's minimal PATH doesn't include /opt/homebrew/bin.
+    # Apple Silicon installs terminal-notifier at /opt/homebrew; Intel at /usr/local.
+    TN=""
+    for cand in /opt/homebrew/bin/terminal-notifier /usr/local/bin/terminal-notifier; do
+      [ -x "$cand" ] && TN="$cand" && break
+    done
+    subtitle="${severe_reason:-${#alerts[@]} issue(s) detected} — click to manage"
+    if [ -n "$TN" ]; then
+      "$TN" \
+        -title "Mac Health Alert" \
+        -subtitle "$subtitle" \
+        -message "$body" \
+        -sound "Sosumi" \
+        -execute "/usr/local/bin/mhealth-kill" \
+        -group "mac-health-watcher" \
+        >/dev/null 2>&1
+    else
+      body_escaped=$(printf '%s' "$body" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' '|' | sed 's/|/\\n/g')
+      /usr/bin/osascript -e "display notification \"${body_escaped}\" with title \"Mac Health Alert\" subtitle \"$subtitle\" sound name \"Sosumi\"" 2>/dev/null
+    fi
+
+    # Auto-launch the dashboard so it's right there when the user looks.
+    /usr/bin/nohup /usr/local/bin/mhealth-kill >/dev/null 2>&1 &
+
+    echo "$now" > "$STATE"
+    [ "$VERBOSE" = "1" ] && echo "ALERTED (severe=$severe):" && printf '  - %s\n' "${alerts[@]}"
+  fi
+fi

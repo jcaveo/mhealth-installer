@@ -1,0 +1,13 @@
+#!/bin/bash
+# mhealth — refresh + display the current Mac health snapshot in the terminal.
+# Use as:  mhealth           (less viewer)
+#          mhealth -p        (plain print, no pager)
+
+set -u
+/usr/local/bin/mac-health-watcher >/dev/null
+
+if [ "${1:-}" = "-p" ]; then
+  cat ~/Library/Logs/mac-health-snapshot.txt
+else
+  less -R ~/Library/Logs/mac-health-snapshot.txt
+fi

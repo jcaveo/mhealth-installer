@@ -1,0 +1,56 @@
+#!/bin/bash
+# postinstall — runs as root after the .pkg copies files to /usr/local/mhealth.
+# Responsibilities:
+#   1. Ensure scripts are executable
+#   2. Create symlinks in /usr/local/bin
+#   3. Run mhealth-setup as the console user to load their LaunchAgents
+#
+# Stderr goes to /var/log/install.log — useful for debugging Gatekeeper issues.
+
+set -u
+
+PREFIX=/usr/local/mhealth
+BIN=/usr/local/bin
+
+log() { echo "[mhealth postinstall] $*"; }
+
+# 1. Make payload binaries executable (pkgbuild usually preserves this, but belt-and-braces)
+log "Setting executable permissions on $PREFIX/bin/*"
+chmod -R 755 "$PREFIX/bin" 2>/dev/null || true
+chmod -R 644 "$PREFIX/templates"/*.plist 2>/dev/null || true
+
+# 2. Create symlinks in /usr/local/bin (must exist on macOS for non-Homebrew use)
+mkdir -p "$BIN"
+for tool in mhealth mhealth-kill mhealth-activity mac-health-watcher mhealth-setup mhealth-uninstall; do
+  src="$PREFIX/bin/$tool"
+  dst="$BIN/$tool"
+  if [ -f "$src" ]; then
+    ln -sf "$src" "$dst"
+    log "linked $dst -> $src"
+  fi
+done
+
+# 3. Identify the console user (the human at the GUI) and run setup as them.
+# stat /dev/console returns the logged-in console user. Falls back to SUDO_USER.
+CONSOLE_USER="$(stat -f '%Su' /dev/console 2>/dev/null || echo '')"
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
+  CONSOLE_USER="${SUDO_USER:-${USER:-}}"
+fi
+
+if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
+  log "running mhealth-setup as $CONSOLE_USER"
+  # launchctl asuser runs in that user's bootstrap so LaunchAgents register correctly
+  CONSOLE_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || echo '')"
+  if [ -n "$CONSOLE_UID" ]; then
+    sudo -u "$CONSOLE_USER" launchctl asuser "$CONSOLE_UID" \
+      /usr/local/bin/mhealth-setup >> /var/log/install.log 2>&1 || \
+      log "WARN: mhealth-setup returned non-zero — user can re-run /usr/local/bin/mhealth-setup manually"
+  else
+    log "WARN: could not resolve uid for $CONSOLE_USER — skipping auto-setup"
+  fi
+else
+  log "WARN: no console user detected — skipping auto-setup. Run /usr/local/bin/mhealth-setup as your user."
+fi
+
+log "done."
+exit 0
