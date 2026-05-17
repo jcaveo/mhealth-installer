@@ -4,6 +4,22 @@ Append-only per CLAUDE.md. New entries on top.
 
 ---
 
+## 2026-05-17 — Caches table: status text + filter chips + per-item progress
+
+**Status:** completed
+**Changes:**
+- Caches table now has an explicit `<colgroup>` with widths — risk badge text ("🟢 SAFE" / "🟡 CAUTION" / "🔴 DANGER") is no longer clipped to icon-only
+- Filter chips above the table: All / 🟢 Safe / 🟡 Caution / 🔴 Danger. Active chip highlighted with accent color
+- Filter counter: "X of Y shown · 🟢 N · 🟡 N · 🔴 N"
+- `cleanOne`/`cleanSelectedDisk` switched from index-based to path-based lookups (filtering broke index assumptions)
+- `doCleanRequest` now sends one HTTP request per item instead of batching → shows real progress: "Cleaning 3/8: …" with a progress bar that fills as items complete
+
+**Why:**
+- User flagged that the icon-only status badge wasn't readable
+- User asked for filter by status + visible progress during cleanup
+
+---
+
 ## 2026-05-17 — Git init + GitHub remote
 
 **Status:** completed

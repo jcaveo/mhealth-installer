@@ -1744,14 +1744,33 @@ HTML = r"""<!DOCTYPE html>
     <div class="toolbar">
       <button class="danger" onclick="cleanSelectedDisk()">Clean Selected</button>
       <button onclick="refreshDisk(true)">Rescan</button>
-      <span class="hint">Whitelisted paths only — caches, trash, build artifacts. Apps rebuild caches on next use.</span>
       <span class="status" id="diskStatus"></span>
     </div>
+    <div class="toolbar" style="margin-top:4px;flex-wrap:wrap;font-size:12px">
+      <span style="color:var(--muted)">Filter:</span>
+      <button class="riskFilter tiny" data-risk="all"     onclick="setRiskFilter('all')"     style="font-weight:600">All</button>
+      <button class="riskFilter tiny" data-risk="safe"    onclick="setRiskFilter('safe')">🟢 Safe</button>
+      <button class="riskFilter tiny" data-risk="caution" onclick="setRiskFilter('caution')">🟡 Caution</button>
+      <button class="riskFilter tiny" data-risk="danger"  onclick="setRiskFilter('danger')">🔴 Danger</button>
+      <span style="color:var(--muted);margin-left:14px" id="diskCount"></span>
+      <div id="diskProgress" style="display:none;margin-left:auto;flex:1;max-width:280px;background:#e5e7eb;border-radius:6px;height:8px;overflow:hidden">
+        <div id="diskProgressBar" style="height:100%;width:0%;background:var(--accent);transition:width 0.2s"></div>
+      </div>
+    </div>
     <table>
+      <colgroup>
+        <col style="width:32px">       <!-- checkbox -->
+        <col style="width:96px">       <!-- risk badge -->
+        <col style="width:90px">       <!-- size -->
+        <col style="width:110px">      <!-- category -->
+        <col style="width:280px">      <!-- path -->
+        <col><!-- what it is, fluid -->
+        <col style="width:140px">      <!-- actions -->
+      </colgroup>
       <thead>
         <tr>
           <th class="col-cb"><input type="checkbox" id="diskSelAll" onchange="toggleAllDisk()"></th>
-          <th class="col-warn"></th>
+          <th>Risk</th>
           <th class="num" data-key="size_mb">Size <span class="arrow">↓</span></th>
           <th data-key="category">Category</th>
           <th>Path</th>
@@ -3246,19 +3265,40 @@ async function refreshDisk(force) {
     setDiskStatus("Scan failed: " + e.message, "err");
   }
 }
+let diskRiskFilter = "all";  // all | safe | caution | danger
+
+function setRiskFilter(level) {
+  diskRiskFilter = level;
+  // Visual: highlight active filter button
+  document.querySelectorAll(".riskFilter").forEach(b => {
+    const active = b.dataset.risk === level;
+    b.style.background = active ? "var(--accent)" : "";
+    b.style.color = active ? "#fff" : "";
+    b.style.borderColor = active ? "var(--accent)" : "";
+  });
+  renderDisk();
+}
+
 function renderDisk() {
   const meta = diskItems.find(x => x._meta)?._meta || {};
-  const items = diskItems.filter(x => !x._meta);
+  const allItems = diskItems.filter(x => !x._meta);
+  const items = diskRiskFilter === "all"
+    ? allItems
+    : allItems.filter(x => (x.risk || x.level || "safe") === diskRiskFilter);
   const usedPct = parseInt(meta.pct || "0");
   document.getElementById("diskSummary").innerHTML = `
     <div><div style="font-size:11px;color:var(--muted)">Total</div><div style="font-weight:600">${meta.total_gb || "?"} GB</div></div>
     <div><div style="font-size:11px;color:var(--muted)">Used</div><div style="font-weight:600">${meta.used_gb || "?"} GB (${meta.pct || "?"})</div></div>
     <div><div style="font-size:11px;color:var(--muted)">Free</div><div style="font-weight:600">${meta.avail_gb || "?"} GB</div></div>
     <div class="disk-bar"><div class="disk-bar-fill" style="width:${usedPct}%"></div></div>
-    <div><div style="font-size:11px;color:var(--muted)">Total recoverable</div><div style="font-weight:600;color:var(--ok)">${items.reduce((s,i)=>s+i.size_mb,0)} MB</div></div>
+    <div><div style="font-size:11px;color:var(--muted)">Total recoverable</div><div style="font-weight:600;color:var(--ok)">${allItems.reduce((s,i)=>s+i.size_mb,0)} MB</div></div>
   `;
+  // Filter counts in header
+  const counts = allItems.reduce((acc, it) => { const r = it.risk || it.level || "safe"; acc[r] = (acc[r]||0)+1; return acc; }, {safe:0,caution:0,danger:0});
+  document.getElementById("diskCount").textContent = `${items.length} of ${allItems.length} shown  ·  🟢 ${counts.safe}  🟡 ${counts.caution}  🔴 ${counts.danger}`;
+
   if (items.length === 0) {
-    document.getElementById("diskRows").innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:24px">No cleanup candidates over 10 MB. Disk is reasonably tidy.</td></tr>`;
+    document.getElementById("diskRows").innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:24px">${allItems.length === 0 ? 'No cleanup candidates over 10 MB. Disk is reasonably tidy.' : 'No items match the current filter.'}</td></tr>`;
     return;
   }
   document.getElementById("diskRows").innerHTML = items.map((it, i) => {
@@ -3271,10 +3311,10 @@ function renderDisk() {
     const pathDisplay = (window.__HOME__ || window.localStorage.getItem('home') || '').length ? it.path.replace(window.__HOME__ || window.localStorage.getItem('home'), '~') : it.path;
     const action = isDocker
       ? `<button class="tiny" onclick="runDockerPrune()" style="background:#fed7aa;border-color:#f59e0b">Prune (safe)</button>`
-      : `<button class="tiny" onclick="cleanOne(${i})">Clean</button>`;
+      : `<button class="tiny" onclick="cleanOneByPath('${escapeHtml(it.path)}')">Clean</button>`;
     const cbDisabled = isDocker ? "disabled title='Use the Prune button, not bulk delete'" : "";
-    return `<tr data-idx="${i}" class="${isRisky ? 'risky' : ''}" title="${escapeHtml(tooltip)}">
-      <td><input type="checkbox" class="disk-cb" data-idx="${i}" onchange="onDiskSelChange(this)" ${cbDisabled}></td>
+    return `<tr data-path="${escapeHtml(it.path)}" class="${isRisky ? 'risky' : ''}" title="${escapeHtml(tooltip)}">
+      <td><input type="checkbox" class="disk-cb" data-path="${escapeHtml(it.path)}" onchange="onDiskSelChange(this)" ${cbDisabled}></td>
       <td>${riskBadge}</td>
       <td class="num"><b>${sizeDisplay}</b></td>
       <td><span class="badge">${escapeHtml(it.category)}</span></td>
@@ -3328,36 +3368,53 @@ function toggleAllDisk() {
 async function openInFinder(path) {
   await fetch("/reveal?path=" + encodeURIComponent(path)).catch(() => {});
 }
-async function cleanOne(idx) {
-  const item = diskItems.filter(x => !x._meta)[idx];
+async function cleanOneByPath(path) {
+  const item = diskItems.find(x => !x._meta && x.path === path);
   if (!item) return;
   if (!confirm(`Delete contents of:\n\n${item.path}\n\n(${item.size_mb} MB) — ${item.desc}\n\nThis is permanent.`)) return;
   await doCleanRequest([item]);
 }
 async function cleanSelectedDisk() {
-  const real = diskItems.filter(x => !x._meta);
   const items = [...document.querySelectorAll("#diskRows .disk-cb:checked")]
-    .map(cb => real[parseInt(cb.dataset.idx)]).filter(Boolean);
+    .map(cb => diskItems.find(x => !x._meta && x.path === cb.dataset.path))
+    .filter(Boolean);
   if (items.length === 0) { setDiskStatus("Nothing selected", "err"); return; }
   const total = items.reduce((s, x) => s + x.size_mb, 0);
   const lines = items.slice(0, 8).map(x => `  ${x.size_mb} MB  ${x.path.split('/').pop()}`).join("\n");
   if (!confirm(`Clean ${items.length} item(s) — ~${total} MB total?\n\n${lines}${items.length>8?'\n  …':''}\n\nDeletion is permanent.`)) return;
   await doCleanRequest(items);
 }
+
 async function doCleanRequest(items) {
-  setDiskStatus("Cleaning…", "");
-  try {
-    const r = await fetch("/disk-clean", { method: "POST",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({paths: items.map(x => ({path: x.path, action: x.action}))}) });
-    const j = await r.json();
-    const ok = j.results.filter(r => r.ok).length;
-    const fail = j.results.filter(r => !r.ok).length;
-    setDiskStatus(`Cleaned ${ok}${fail ? `, ${fail} failed` : ""}`, fail ? "err" : "ok");
-    setTimeout(() => refreshDisk(true), 800);
-  } catch (e) {
-    setDiskStatus("Clean failed: " + e.message, "err");
+  const bar = document.getElementById("diskProgress");
+  const fill = document.getElementById("diskProgressBar");
+  if (bar) bar.style.display = "block";
+  if (fill) fill.style.width = "0%";
+
+  let done = 0, ok = 0, fail = 0;
+  // Send one request per item so the user gets real progress updates.
+  // /disk-clean accepts an array but we slice it to 1-item batches.
+  for (const item of items) {
+    const shortName = item.path.split('/').slice(-2).join('/');
+    setDiskStatus(`Cleaning ${done + 1}/${items.length}: ${shortName}…`, "");
+    try {
+      const r = await fetch("/disk-clean", { method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({paths: [{path: item.path, action: item.action}]}) });
+      const j = await r.json();
+      const itemOk = (j.results || []).every(x => x.ok);
+      if (itemOk) ok++; else fail++;
+    } catch (e) {
+      fail++;
+    }
+    done++;
+    if (fill) fill.style.width = (done / items.length * 100).toFixed(1) + "%";
   }
+  setDiskStatus(`Cleaned ${ok} of ${items.length}${fail ? ` — ${fail} failed` : ""}`, fail ? "err" : "ok");
+  setTimeout(() => {
+    if (bar) bar.style.display = "none";
+    refreshDisk(true);
+  }, 1500);
 }
 
 // --- Column resizing (with localStorage persistence per table) ---
