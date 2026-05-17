@@ -5,12 +5,26 @@ Single-machine local web UI at `http://127.0.0.1:8765/`.
 
 ---
 
+## 0. Prerequisite — install Homebrew Python (important)
+
+Before installing mhealth, install Python via Homebrew:
+
+```bash
+brew install python
+```
+
+**Why this matters:** mhealth runs Python under launchd. macOS's TCC (the privacy system that gates ~/Desktop, ~/Documents, ~/Downloads access) **silently ignores Full Disk Access grants for Apple's system Python** (`com.apple.python3` bundle). With Homebrew Python (`org.python.python` bundle), grants work correctly.
+
+Without brew Python, the folder scanner can't read ~/Desktop or ~/Downloads no matter how many times you grant permission — macOS just discards the grant.
+
+(Don't have Homebrew? Install it first from [brew.sh](https://brew.sh) — one-liner from the website.)
+
 ## 1. Install the .pkg
 
 1. Download `mhealth-installer.pkg` (ask JC for the latest link).
 2. **Right-click → Open** in Finder. Don't double-click — the pkg is unsigned, so Gatekeeper blocks double-click but allows the right-click route.
 3. Click **Open** in the Gatekeeper prompt → enter your admin password → install.
-4. After install, the dashboard auto-launches at `http://127.0.0.1:8765/`.
+4. After install, the dashboard auto-launches at `http://127.0.0.1:8765/`. mhealth-setup auto-detects your Homebrew Python and uses it.
 
 **To uninstall later:**
 ```bash

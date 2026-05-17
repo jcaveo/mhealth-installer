@@ -4,6 +4,33 @@ Append-only per CLAUDE.md. New entries on top.
 
 ---
 
+## 2026-05-17 — Root cause fix: ALWAYS use brew Python (Apple's silently fails TCC)
+
+**Status:** completed
+**ROOT CAUSE:** macOS TCC **silently ignores** Full Disk Access grants for Apple's `com.apple.python3` bundle (the Python.app inside CommandLineTools). User can drag it in, toggle ON, see green checkmark — but `os.listdir(~/Desktop)` still returns `Operation not permitted`. Apple's policy is that com.apple.* bundles don't need user-level FDA grants for OS reasons.
+
+Brew Python uses bundle ID `org.python.python` — TCC honors that grant normally.
+
+**Changes:**
+- Plist templates (`com.mhealth.server.plist`, `com.mhealth.activity.plist`) now have a `__PYTHON__` placeholder in `ProgramArguments[0]` — the launchd plist explicitly invokes the chosen Python (no more relying on `#!/usr/bin/env python3` shebang resolution).
+- `mhealth-setup` finds the best Python:
+  1. `/opt/homebrew/bin/python3` (Apple Silicon brew) — preferred
+  2. `/usr/local/bin/python3` (Intel brew)
+  3. Skip if either is just a symlink into CommandLineTools (still Apple Python)
+  4. Fall back to `/usr/bin/python3` with a LOUD warning that TCC grants won't work
+- `mhealth-setup` substitutes both `__HOME__` and `__PYTHON__` when rendering plists
+- INSTALL.md gets a new **Section 0** (prerequisite): "install Homebrew Python before mhealth, here's why" — with the TCC explanation up front
+
+**Verified on JC's Mac:**
+- Switched JC's local plist (`com.jc.mhealth-server.plist`) to use `/opt/homebrew/bin/python3` explicitly
+- Restarted via launchctl bootstrap
+- Diagnose now reports: ✓ Desktop OK · ✓ Documents OK · ✓ Downloads OK
+- Bundle ID confirmed: `org.python.python` (vs Apple's `com.apple.python3`)
+
+**For distributed pkg:** the postinstall + mhealth-setup will automatically pick brew Python if installed. If only Apple Python is available, mhealth still installs but folder scanning under ~/Desktop/~/Downloads won't work — user is told this loudly in mhealth-setup output AND in INSTALL.md §0.
+
+---
+
 ## 2026-05-17 — TCC: detect Python.app + diagnostic flow
 
 **Status:** completed

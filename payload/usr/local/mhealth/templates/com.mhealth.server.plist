@@ -6,6 +6,7 @@
     <string>com.mhealth.server</string>
     <key>ProgramArguments</key>
     <array>
+        <string>__PYTHON__</string>
         <string>/usr/local/bin/mhealth-kill</string>
         <string>--service</string>
     </array>

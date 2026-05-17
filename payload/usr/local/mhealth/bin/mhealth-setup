@@ -22,6 +22,32 @@ mkdir -p "$LAUNCH_DIR"
 mkdir -p "$HOME/Library/Logs"
 mkdir -p "$HOME/Library/Application Support/mac-health-watcher"
 
+# Find a Python that macOS TCC will actually honor grants for.
+# Apple's /usr/bin/python3 (com.apple.python3 bundle) is SILENTLY ignored by TCC —
+# Full Disk Access grants for it don't actually take effect for ~/Desktop or
+# ~/Downloads. Prefer Homebrew Python (org.python.python bundle) which works.
+PYTHON_PATH=""
+for cand in /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+  if [ -x "$cand" ] && ! readlink "$cand" 2>/dev/null | grep -q "Library/Developer/CommandLineTools"; then
+    PYTHON_PATH="$cand"
+    echo "→ Using Python at: $PYTHON_PATH"
+    break
+  fi
+done
+
+if [ -z "$PYTHON_PATH" ]; then
+  echo ""
+  echo "⚠️  No non-Apple Python found. Falling back to /usr/bin/python3."
+  echo "⚠️  macOS TCC will SILENTLY IGNORE Full Disk Access grants for Apple's"
+  echo "    com.apple.python3 bundle. Scanning ~/Desktop and ~/Downloads will FAIL."
+  echo ""
+  echo "    Strongly recommended: install Homebrew Python and re-run mhealth-setup:"
+  echo "      brew install python"
+  echo "      mhealth-setup"
+  echo ""
+  PYTHON_PATH="/usr/bin/python3"
+fi
+
 # All three jobs install by default:
 #   watcher  — 5-min health sampler (notifications)
 #   activity — 1-min foreground-app / browser-tab / idle logger to ~/Library/Logs/mhealth-activity.csv
@@ -49,8 +75,8 @@ for job in $JOBS; do
   # Unload any prior version (bootout is the modern equivalent of unload)
   launchctl bootout "gui/${UID_NUM}" "$dst" 2>/dev/null || true
 
-  # Render the template — only __HOME__ needs substituting
-  sed "s|__HOME__|${HOME}|g" "$src" > "$dst"
+  # Render the template — substitute __HOME__ and __PYTHON__
+  sed -e "s|__HOME__|${HOME}|g" -e "s|__PYTHON__|${PYTHON_PATH}|g" "$src" > "$dst"
 
   # Load into the current GUI session
   if ! launchctl bootstrap "gui/${UID_NUM}" "$dst" 2>/dev/null; then
