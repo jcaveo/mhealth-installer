@@ -4,6 +4,20 @@ Append-only per CLAUDE.md. New entries on top.
 
 ---
 
+## 2026-05-17 — Delete/Archive Selected: respect user's selection + fix \n literals
+
+**Status:** completed
+**Changes:**
+- "Delete selected" now acts on EVERYTHING the user ticked (not silently filtered to only `delete`-category items). Confirm dialog breaks down the selection by category with appropriate warnings: 🗑 safe regenerable / ☁️ cold assets (suggest Archive instead) / ⚠️ git repos / 🔒 keep items. User can proceed anyway after seeing the breakdown.
+- "Archive selected" same treatment — acts on whole selection, confirm dialog explains category breakdown (e.g., "🗑 regenerable items selected — wasteful to cloud-archive these, just delete locally").
+- Fixed all `\\n` / `\\n\\n` literal escape bugs in alert messages — now uses real newlines so dialogs format properly instead of showing `\n` as text.
+
+**Why:**
+- User selected a 128 MB GoogleDrive.dmg (correctly classified `archive`) and clicked "Delete selected" expecting it to delete. The old behavior silently filtered to only `delete`-category items, leaving the .dmg untouched and showing a confusing tip about clicking the header checkbox.
+- Same `\n` literal bug as the previous Restart dialog — different alert site, same root cause.
+
+---
+
 ## 2026-05-17 — Bulletproof teammate install: install.sh + dashboard self-heal banner
 
 **Status:** completed

@@ -3623,43 +3623,75 @@ function selectedScan(category) {
 }
 
 async function deleteRegenerableSelected() {
-  const paths = selectedScan("delete");
-  if (paths.length === 0) {
-    alert("No items in 'delete' category are selected.\\nTip: click the header checkbox to select all, then this button will only act on 🗑 items.");
+  // Act on EVERYTHING the user selected — don't silently filter. If they
+  // selected non-regenerable items, warn loudly in the confirm.
+  const allSelected = Array.from(document.querySelectorAll(".scan-cb"))
+    .filter(cb => cb.checked);
+  if (allSelected.length === 0) {
+    alert("Nothing selected. Tick the checkbox next to one or more rows first.");
     return;
   }
-  if (!confirm(`Delete ${paths.length} regenerable item(s)? They will be re-created by npm install / docker pull / build tools when needed.`)) return;
+  const byCat = { delete: [], archive: [], check: [], keep: [] };
+  for (const cb of allSelected) {
+    const cat = cb.dataset.category;
+    (byCat[cat] || (byCat[cat] = [])).push(cb.dataset.path);
+  }
+  const risky = (byCat.archive.length + byCat.check.length + byCat.keep.length);
+  let msg = `Delete ${allSelected.length} item(s) from disk? This is permanent.`;
+  if (byCat.delete.length) {
+    msg += `\n\n🗑 ${byCat.delete.length} regenerable item(s) — safe, easily recreated.`;
+  }
+  if (risky) {
+    msg += `\n\n⚠️ ${risky} NON-REGENERABLE item(s) selected:`;
+    if (byCat.archive.length) msg += `\n   ☁️ ${byCat.archive.length} cold asset(s) — consider Archive instead.`;
+    if (byCat.check.length)   msg += `\n   ⚠️ ${byCat.check.length} git repo(s) — may contain untracked work.`;
+    if (byCat.keep.length)    msg += `\n   🔒 ${byCat.keep.length} 'keep' item(s) — flagged as source code or configs.`;
+    msg += `\n\nProceed anyway?`;
+  }
+  if (!confirm(msg)) return;
+
+  const paths = allSelected.map(cb => cb.dataset.path);
   const r = await fetch("/cloud/delete-bulk", {
     method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({paths}),
   });
   const j = await r.json();
-  alert(`Deleted ${j.deleted}, failed ${j.failed.length}, skipped ${j.skipped.length}.`);
+  let summary = `Deleted ${j.deleted}`;
+  if (j.failed.length) summary += `, ${j.failed.length} failed`;
+  if (j.skipped.length) summary += `, ${j.skipped.length} skipped (path safety check)`;
+  alert(summary);
   scanFolder();
 }
 
 async function archiveSelected() {
   const remote = document.getElementById("archiveRemote").value;
-  if (!remote) { alert("Select a remote first."); return; }
-  // Allow archive or check categories (user accepts risk on check via confirm)
-  const archivable = Array.from(document.querySelectorAll(".scan-cb"))
-    .filter(cb => cb.checked && (cb.dataset.category === "archive" || cb.dataset.category === "check"))
-    .map(cb => cb.dataset.path);
-  if (archivable.length === 0) {
-    alert("No archivable items selected (need ☁️ or ⚠️ category).");
+  if (!remote) { alert("Select a cloud remote first (Archive to: dropdown)."); return; }
+
+  // Act on EVERYTHING selected, with category-aware warning in the confirm.
+  const allSelected = Array.from(document.querySelectorAll(".scan-cb")).filter(cb => cb.checked);
+  if (allSelected.length === 0) {
+    alert("Nothing selected. Tick the checkbox next to one or more rows first.");
     return;
   }
-  const hasCheck = Array.from(document.querySelectorAll(".scan-cb"))
-    .some(cb => cb.checked && cb.dataset.category === "check");
-  let msg = `Archive ${archivable.length} item(s) to ${remote}? Each will be uploaded, verified, then deleted locally.`;
-  if (hasCheck) msg += "\\n\\n⚠️ Includes git repos — confirm no untracked/unpushed work first.";
+  const byCat = { archive: [], check: [], keep: [], delete: [] };
+  for (const cb of allSelected) {
+    const cat = cb.dataset.category;
+    (byCat[cat] || (byCat[cat] = [])).push(cb.dataset.path);
+  }
+
+  let msg = `Archive ${allSelected.length} item(s) to ${remote}?\n\nEach will be uploaded, verified, then deleted locally.`;
+  if (byCat.archive.length) msg += `\n\n☁️ ${byCat.archive.length} cold asset(s) — recommended for archive.`;
+  if (byCat.check.length)   msg += `\n\n⚠️ ${byCat.check.length} git repo(s) — confirm no untracked/unpushed work first!`;
+  if (byCat.delete.length)  msg += `\n\n🗑 ${byCat.delete.length} regenerable item(s) — wasteful to cloud-archive these (just delete locally instead).`;
+  if (byCat.keep.length)    msg += `\n\n🔒 ${byCat.keep.length} 'keep' item(s) — small files / source code. Probably belongs in git, not cloud.`;
   if (!confirm(msg)) return;
 
+  const paths = allSelected.map(cb => cb.dataset.path);
   const status = document.getElementById("scanStatus");
   let okCount = 0, failed = [];
-  for (let i = 0; i < archivable.length; i++) {
-    const p = archivable[i];
-    status.textContent = `Archiving ${i+1}/${archivable.length}: ${p.split("/").pop()}…`;
+  for (let i = 0; i < paths.length; i++) {
+    const p = paths[i];
+    status.textContent = `Archiving ${i+1}/${paths.length}: ${p.split("/").pop()}…`;
     status.className = "status";
     try {
       const r = await fetch("/cloud/archive", {
@@ -3672,10 +3704,10 @@ async function archiveSelected() {
       failed.push({path: p, err: e.message});
     }
   }
-  status.textContent = `Archived ${okCount} of ${archivable.length}`;
-  status.className = okCount === archivable.length ? "status ok" : "status err";
+  status.textContent = `Archived ${okCount} of ${paths.length}`;
+  status.className = okCount === paths.length ? "status ok" : "status err";
   if (failed.length) {
-    alert("Some failed:\\n" + failed.map(f => `${f.path}\\n  → ${f.err}`).join("\\n\\n"));
+    alert("Some failed:\n\n" + failed.map(f => `${f.path}\n  → ${f.err}`).join("\n\n"));
   }
   refreshCloud();
   scanFolder();
