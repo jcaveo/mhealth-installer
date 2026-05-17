@@ -4,6 +4,26 @@ Append-only per CLAUDE.md. New entries on top.
 
 ---
 
+## 2026-05-17 — One-click server restart (no more Terminal commands)
+
+**Status:** completed
+**Changes:**
+- New endpoint `POST /system/restart` — responds 200 OK first, then exits 300 ms later via `SHUTDOWN.set()`. Launchd's KeepAlive=true + ThrottleInterval=10 brings it back automatically in ~3-8 seconds.
+- `restartServerAndRescan()` rewritten:
+  - Fixed the `\n\n` literal-string bug (was using `\\n\\n` which rendered as escape codes in the alert)
+  - Replaces the alert dialog with a full-screen blocking overlay showing "Restarting server… ⏳"
+  - POSTs `/system/restart`, then polls `/ping` every 500 ms (with a 20s deadline) until the server is back
+  - Live countdown in the overlay: "Waiting for server… (12s left)"
+  - On success: overlay flashes "Server restored. Rescanning…" then auto-rescans the original path
+  - No Terminal commands, no manual steps
+
+**Why:**
+- User screenshot showed an alert with literal `\n\n` text AND asked "is there an easier way?" — both legit complaints. Self-restart via launchd is the right pattern; we already had the infrastructure (KeepAlive=true on the plist) but never wired the trigger.
+
+**Verified:** end-to-end test — POST /system/restart returned `{"ok":true}`; server came back at the 8-second poll mark. Client-side overlay + auto-rescan flow exercised via the TCC help card.
+
+---
+
 ## 2026-05-17 — TCC help: reveal-python + drag-and-drop flow
 
 **Status:** completed

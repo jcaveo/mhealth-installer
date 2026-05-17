@@ -3361,12 +3361,52 @@ async function copyTextToClipboard(text, btn) {
 }
 
 async function restartServerAndRescan(path) {
-  // We can't restart ourselves from the browser, but we can tell the user how.
-  // For now: just retry the scan — if they've granted TCC, the cached subprocess
-  // doesn't help (already running). Need a manual restart via Terminal.
-  alert("To restart, open Terminal and run:\\n\\n  launchctl kickstart -k \"gui/$(id -u)/com.mhealth.server\"\\n\\nThen re-click Scan. (If your launch agent is named com.jc.mhealth-server instead, use that label.)");
+  // Show a blocking overlay while we wait for launchd to bring the server back.
+  let overlay = document.getElementById("restartOverlay");
+  if (!overlay) {
+    overlay = document.createElement("div");
+    overlay.id = "restartOverlay";
+    overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:10000;display:flex;align-items:center;justify-content:center;color:#fff;font-size:15px";
+    document.body.appendChild(overlay);
+  }
+  overlay.innerHTML = `<div style="background:#1f2937;border-radius:10px;padding:24px 32px;text-align:center;min-width:280px">
+    <div style="font-size:28px;margin-bottom:10px">⏳</div>
+    <div id="restartMsg" style="font-weight:600;margin-bottom:6px">Restarting server…</div>
+    <div style="font-size:12px;opacity:0.7" id="restartSub">Triggering shutdown. launchd will bring it back in a moment.</div>
+  </div>`;
+  overlay.style.display = "flex";
+
+  // 1. Tell the server to restart.
+  try {
+    await fetch("/system/restart", { method: "POST" });
+  } catch {
+    // The fetch may fail because the server exits before sending — that's expected.
+  }
+
+  // 2. Poll /ping until it answers again.
+  const msg = document.getElementById("restartMsg");
+  const sub = document.getElementById("restartSub");
+  const deadline = Date.now() + 20000; // 20 s max wait
+  await new Promise(r => setTimeout(r, 800)); // give launchd a head start
+  while (Date.now() < deadline) {
+    try {
+      const r = await fetch("/ping", { cache: "no-store" });
+      if (r.ok) {
+        msg.textContent = "Server restored. Rescanning…";
+        sub.textContent = "";
+        break;
+      }
+    } catch {
+      // Still down — keep polling
+    }
+    sub.textContent = `Waiting for server… (${Math.ceil((deadline - Date.now()) / 1000)} s left)`;
+    await new Promise(r => setTimeout(r, 500));
+  }
+
+  // 3. Hide overlay and re-scan.
+  setTimeout(() => { overlay.style.display = "none"; }, 800);
   document.getElementById("scanPath").value = path;
-  setTimeout(() => scanFolder(), 500);
+  setTimeout(() => scanFolder(), 1000);
 }
 
 function renderScanResult() {
@@ -4393,6 +4433,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 except Exception as e:
                     failed.append({"path": p, "error": str(e)})
             self._send(200, json.dumps({"ok": True, "deleted": deleted, "failed": failed, "skipped": skipped}).encode(), "application/json")
+
+        elif self.path == "/system/restart":
+            # Trigger shutdown; launchd KeepAlive brings us back in ~3s.
+            # We respond OK *first*, then exit in a background timer so the
+            # response actually reaches the client.
+            self._send(200, b'{"ok":true}', "application/json")
+            threading.Timer(0.3, lambda: SHUTDOWN.set()).start()
+            return
 
         elif self.path == "/quit":
             self._send(200, b"bye", "text/plain")
