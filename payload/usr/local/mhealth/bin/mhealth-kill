@@ -2137,9 +2137,9 @@ HTML = r"""<!DOCTYPE html>
           <span class="status" id="archStatus"></span>
         </div>
         <table id="archTable">
-          <colgroup><col><col style="width:90px"><col style="width:90px"><col style="width:200px"></colgroup>
-          <thead><tr><th>Original path</th><th>Remote</th><th class="num">Size</th><th></th></tr></thead>
-          <tbody id="archRows"><tr><td colspan="4" style="text-align:center;color:var(--muted);padding:20px">No archives yet.</td></tr></tbody>
+          <colgroup><col style="width:200px"><col><col style="width:80px"><col style="width:70px"><col style="width:200px"></colgroup>
+          <thead><tr><th>Filename</th><th>Original path</th><th>Remote</th><th class="num">Size</th><th></th></tr></thead>
+          <tbody id="archRows"><tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">No archives yet.</td></tr></tbody>
         </table>
         <div style="margin-top:18px;padding:10px 14px;background:#f9fafb;border:1px solid var(--line);border-radius:8px;font-size:12px;color:var(--muted);line-height:1.55">
           <b>What goes where:</b><br>
@@ -3295,26 +3295,30 @@ function renderArchives() {
   const rows = document.getElementById("archRows");
   const archives = cloudState.archives || [];
   rows.innerHTML = archives.length === 0
-    ? `<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:20px">No archives yet.</td></tr>`
+    ? `<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">No archives yet.</td></tr>`
     : archives.map(a => {
         const dt = new Date(a.archived_at).toLocaleString([], {month:"short",day:"numeric",hour:"numeric",minute:"2-digit"});
-        // a.name was set at archive time (basename). Fall back to deriving it.
         const fileName = a.name || (a.original_path || "").split("/").filter(Boolean).pop() || "(unknown)";
         const home = window.__HOME__ || "";
         const pathDisplay = home && a.original_path && a.original_path.startsWith(home + "/")
           ? "~/" + a.original_path.slice(home.length + 1)
           : (a.original_path || "");
+        const remotePathDisplay = a.remote && a.remote_path ? `${a.remote}:${a.remote_path}` : "";
         return `<tr>
-          <td>
+          <td style="vertical-align:top">
             <div style="font-weight:600;font-size:13px;word-break:break-all">${a.is_dir ? "📁 " : "📄 "}${escapeHtml(fileName)}</div>
-            <code style="font-size:11px;color:var(--muted);word-break:break-all">${escapeHtml(pathDisplay)}</code>
             <div style="color:var(--muted);font-size:11px;margin-top:2px">archived ${escapeHtml(dt)}</div>
           </td>
-          <td><span class="badge">${escapeHtml(a.remote)}</span></td>
-          <td class="num">${fmtBytes(a.size_bytes)}</td>
-          <td>
-            <button class="tiny" onclick="restoreArchive('${escapeHtml(a.id)}')">Restore</button>
-            <button class="tiny danger" onclick="deleteArchiveItem('${escapeHtml(a.id)}','${escapeHtml(fileName)}')">Delete from cloud</button>
+          <td style="vertical-align:top">
+            <code style="font-size:11px;color:var(--muted);word-break:break-all">${escapeHtml(pathDisplay)}</code>
+            ${remotePathDisplay ? `<div style="font-size:10px;color:var(--muted);margin-top:2px"><b>cloud:</b> <code>${escapeHtml(remotePathDisplay)}</code></div>` : ""}
+          </td>
+          <td style="vertical-align:top"><span class="badge">${escapeHtml(a.remote)}</span></td>
+          <td class="num" style="vertical-align:top">${fmtBytes(a.size_bytes)}</td>
+          <td style="vertical-align:top">
+            <button class="tiny" onclick="restoreArchive('${escapeHtml(a.id)}')" title="Download back to original path">Restore</button>
+            <button class="tiny" onclick="openInCloud('${escapeHtml(a.remote)}', '${escapeHtml(remotePathDisplay)}')" title="Open ${escapeHtml(a.remote)} web UI in browser">🔗 Open in cloud</button>
+            <button class="tiny danger" onclick="deleteArchiveItem('${escapeHtml(a.id)}','${escapeHtml(fileName)}')" title="Remove remote copy + registry entry">Delete from cloud</button>
           </td>
         </tr>`;
       }).join("");
@@ -3932,9 +3936,34 @@ async function restoreArchive(id) {
 }
 
 async function deleteArchiveItem(id, name) {
-  if (!confirm(`Delete cloud copy of "${name}"?\\nThis removes the remote files AND the archive record.\\nLocal files (if any) are untouched.`)) return;
+  if (!confirm(`Delete cloud copy of "${name}"?\nThis removes the remote files AND the archive record.\nLocal files (if any) are untouched.`)) return;
   await fetch("/cloud?id=" + encodeURIComponent(id), { method: "DELETE" });
   refreshCloud();
+}
+
+async function openInCloud(remote, remotePath) {
+  try {
+    const r = await fetch("/cloud/open-web?remote=" + encodeURIComponent(remote));
+    const j = await r.json();
+    if (!j.ok) {
+      alert("Couldn't open cloud UI:\n\n" + (j.error || "unknown") +
+            "\n\nYour archive lives at:\n  " + remotePath);
+      return;
+    }
+    // Most cloud UIs don't accept deep links to private files without first
+    // generating a public share link (which has privacy implications). So we
+    // open the cloud UI to its root and show a toast with the exact path so
+    // the user knows where to navigate.
+    if (remotePath) {
+      const toast = document.createElement("div");
+      toast.style.cssText = "position:fixed;bottom:20px;right:20px;background:#1f2937;color:#fff;padding:12px 16px;border-radius:8px;z-index:9999;max-width:420px;font-size:12px;box-shadow:0 4px 16px rgba(0,0,0,0.3);line-height:1.5";
+      toast.innerHTML = `Opened <b>${escapeHtml(remote)}</b> web UI.<br>Navigate to:<br><code style="color:#86efac;font-size:11px;word-break:break-all">${escapeHtml(remotePath)}</code>`;
+      document.body.appendChild(toast);
+      setTimeout(() => toast.remove(), 10000);
+    }
+  } catch (e) {
+    alert("Failed: " + e.message);
+  }
 }
 
 // --- Projects tracker ----------------------------------------------------
@@ -4542,6 +4571,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 result = {"ok": ok, "target": tgt, "items": merged_items,
                           "totals_bytes": merged_totals, "errors": errors}
             self._send(200, json.dumps(result).encode(), "application/json")
+        elif self.path.startswith("/cloud/open-web"):
+            # Open the remote's web UI in the user's default browser.
+            from urllib.parse import urlparse, parse_qs
+            params = parse_qs(urlparse(self.path).query)
+            remote_name = (params.get("remote", [""])[0]).strip()
+            # Look up the remote's type to choose the right URL
+            remotes = {r["name"]: r["type"] for r in rclone_remotes()}
+            rtype = remotes.get(remote_name, "")
+            web_urls = {
+                "mega":     "https://mega.nz/fm",
+                "drive":    "https://drive.google.com/drive/my-drive",
+                "dropbox":  "https://www.dropbox.com/home",
+                "onedrive": "https://onedrive.live.com",
+                "box":      "https://app.box.com/folder/0",
+                "pcloud":   "https://my.pcloud.com",
+                "s3":       "https://dash.cloudflare.com/?to=/:account/r2/default/buckets",  # closest for R2
+                "storj":    "https://storj.io/login",
+            }
+            url = web_urls.get(rtype)
+            if not url:
+                self._send(400, json.dumps({"ok": False, "error": f"no web UI mapping for backend '{rtype}'"}).encode(), "application/json")
+            else:
+                try:
+                    subprocess.Popen(["open", url])
+                    self._send(200, json.dumps({"ok": True, "url": url}).encode(), "application/json")
+                except Exception as e:
+                    self._send(500, json.dumps({"ok": False, "error": str(e)}).encode(), "application/json")
         elif self.path == "/cloud/jobs":
             with _JOBS_LOCK:
                 jobs = sorted(ARCHIVE_JOBS.values(),
