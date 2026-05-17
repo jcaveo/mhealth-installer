@@ -2239,7 +2239,7 @@ HTML = r"""<!DOCTYPE html>
       <button onclick="exportReadLater()">Export JSON</button>
       <span class="status" id="rlStatus"></span>
     </div>
-    <table>
+    <table id="readlaterTable">
       <colgroup>
         <col style="width:140px">
         <col style="width:110px">
@@ -2283,7 +2283,7 @@ HTML = r"""<!DOCTYPE html>
         <div id="diskProgressBar" style="height:100%;width:0%;background:var(--accent);transition:width 0.2s"></div>
       </div>
     </div>
-    <table>
+    <table id="cachesTable">
       <colgroup>
         <col style="width:32px">       <!-- checkbox -->
         <col style="width:96px">       <!-- risk badge -->
@@ -2388,7 +2388,7 @@ HTML = r"""<!DOCTYPE html>
         </div>
         <div id="reconcileResult" style="display:none;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:12px"></div>
         <table id="archTable">
-          <colgroup><col style="width:200px"><col><col style="width:80px"><col style="width:100px"><col style="width:200px"></colgroup>
+          <colgroup><col style="width:200px"><col><col style="width:80px"><col style="width:100px"><col style="width:360px"></colgroup>
           <thead><tr><th>Filename</th><th>Original path</th><th>Remote</th><th class="num">Size</th><th></th></tr></thead>
           <tbody id="archRows"><tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">No archives yet.</td></tr></tbody>
         </table>
@@ -2545,7 +2545,8 @@ HTML = r"""<!DOCTYPE html>
       <!-- Top-right: Top sites visited (with time spent column) -->
       <section>
         <h2>Top sites visited <span style="color:var(--muted);font-weight:400;font-size:12px">(browser history + active minutes)</span></h2>
-        <table>
+        <table id="topSitesTable">
+          <colgroup><col><col style="width:90px"><col style="width:80px"><col style="width:80px"></colgroup>
           <thead><tr><th>Host</th><th>Browser</th><th class="num">Time</th><th class="num">Visits</th></tr></thead>
           <tbody id="siteRows"></tbody>
         </table>
@@ -2553,7 +2554,8 @@ HTML = r"""<!DOCTYPE html>
       <!-- Bottom-left: Top shell commands -->
       <section>
         <h2>Top shell commands <span style="color:var(--muted);font-weight:400;font-size:12px">(zsh history in range)</span></h2>
-        <table>
+        <table id="topCmdsTable">
+          <colgroup><col><col style="width:80px"></colgroup>
           <thead><tr><th>Command</th><th class="num">Count</th></tr></thead>
           <tbody id="cmdRows"></tbody>
         </table>
@@ -4878,12 +4880,39 @@ function makeColumnsResizable(tableId) {
   });
 }
 
-// Run after first render lays down the headers
+// All tables that should be resizable. Some don't exist on every refresh
+// (e.g. scanTable hidden until first scan) — makeColumnsResizable safely
+// no-ops on missing tables.
+const RESIZABLE_TABLES = [
+  "procTable",      // Processes
+  "tabTable",       // Browser Tabs
+  "readlaterTable", // Read Later
+  "cachesTable",    // Caches
+  "scanTable",      // Archive — folder scan results
+  "archTable",      // Archive — archived items
+  "projTable",      // Projects
+  "topSitesTable",  // Time Spent — sites
+  "topCmdsTable",   // Time Spent — commands
+];
+
+function makeAllTablesResizable() {
+  RESIZABLE_TABLES.forEach(makeColumnsResizable);
+}
+
+// Re-init resize handles whenever the per-tab refresh re-renders the headers.
 const _origRender = render;
 render = function() {
   _origRender();
-  makeColumnsResizable("procTable");
-  makeColumnsResizable("tabTable");
+  makeAllTablesResizable();
+};
+// Also re-init when other tabs render (they may have created new tables)
+document.addEventListener("DOMContentLoaded", makeAllTablesResizable);
+setTimeout(makeAllTablesResizable, 600);  // catch tables rendered after initial load (scan, archive, etc.)
+// And when any tab is switched
+const _origSwitchTab2 = switchTab;
+switchTab = function(name) {
+  _origSwitchTab2(name);
+  setTimeout(makeAllTablesResizable, 100);
 };
 
 refresh();
