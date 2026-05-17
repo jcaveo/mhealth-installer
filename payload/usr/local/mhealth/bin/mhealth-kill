@@ -2269,7 +2269,7 @@ HTML = r"""<!DOCTYPE html>
         </div>
         <div id="reconcileResult" style="display:none;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:12px"></div>
         <table id="archTable">
-          <colgroup><col style="width:200px"><col><col style="width:80px"><col style="width:70px"><col style="width:200px"></colgroup>
+          <colgroup><col style="width:200px"><col><col style="width:80px"><col style="width:100px"><col style="width:200px"></colgroup>
           <thead><tr><th>Filename</th><th>Original path</th><th>Remote</th><th class="num">Size</th><th></th></tr></thead>
           <tbody id="archRows"><tr><td colspan="5" style="text-align:center;color:var(--muted);padding:20px">No archives yet.</td></tr></tbody>
         </table>
@@ -3242,8 +3242,9 @@ n/s/q> q`))}
 
 function fmtBytes(n) {
   if (n == null || n < 0) return "—";  // rclone reports -1 for unknown (e.g., Mega dir sizes)
-  if (n < 1024) return n + " B";
-  if (n < 1048576) return (n/1024).toFixed(1) + " KB";
+  if (n === 0) return "0 KB";
+  // Always use KB/MB/GB — never raw bytes.
+  if (n < 1048576) return (n/1024).toFixed(n < 10240 ? 2 : 1) + " KB";
   if (n < 1073741824) return (n/1048576).toFixed(1) + " MB";
   return (n/1073741824).toFixed(2) + " GB";
 }
@@ -3446,7 +3447,7 @@ function renderArchives() {
             ${remotePathDisplay ? `<div style="font-size:10px;color:var(--muted);margin-top:2px"><b>cloud:</b> <code>${escapeHtml(remotePathDisplay)}</code></div>` : ""}
           </td>
           <td style="vertical-align:top"><span class="badge">${escapeHtml(a.remote)}</span></td>
-          <td class="num" style="vertical-align:top">${fmtBytes(a.size_bytes)}</td>
+          <td class="num" style="vertical-align:top;white-space:nowrap">${fmtBytes(a.size_bytes)}</td>
           <td style="vertical-align:top">
             <button class="tiny" onclick="restoreArchive('${escapeHtml(a.id)}')" title="Download back to original path">Restore</button>
             <button class="tiny" onclick="openInCloud('${escapeHtml(a.remote)}', '${escapeHtml(remotePathDisplay)}')" title="Open ${escapeHtml(a.remote)} web UI in browser">🔗 Open in cloud</button>
