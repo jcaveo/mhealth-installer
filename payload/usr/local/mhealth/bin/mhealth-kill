@@ -4278,22 +4278,51 @@ function renderJobs(jobs) {
   if (!el) return;
   if (jobs.length === 0) { el.style.display = "none"; return; }
 
-  const fmtAge = (sec) => {
-    const a = Math.floor(sec);
+  const fmtDur = (sec) => {
+    const a = Math.max(0, Math.floor(sec));
     if (a < 60) return a + "s";
     if (a < 3600) return Math.floor(a/60) + "m " + (a%60) + "s";
     return Math.floor(a/3600) + "h " + Math.floor((a%3600)/60) + "m";
   };
+  const fmtAgo = (sec) => {
+    const a = Math.max(0, Math.floor(sec));
+    if (a < 60) return a + "s ago";
+    if (a < 3600) return Math.floor(a/60) + "m ago";
+    if (a < 86400) return Math.floor(a/3600) + "h ago";
+    return Math.floor(a/86400) + "d ago";
+  };
+  const fmtAbsTime = (epochSec) => {
+    if (!epochSec) return "";
+    const d = new Date(epochSec * 1000);
+    return d.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+  };
+
   const now = Date.now() / 1000;
   const recent = jobs.slice(0, 10);  // show most recent 10
   const html = recent.map(j => {
-    const age = fmtAge(now - (j.started_at || now));
     let icon, label, color;
     if (j.status === "queued") { icon = "⏳"; label = "queued"; color = "#6b7280"; }
     else if (j.status === "running") { icon = "🔄"; label = j.stage === "check" ? "verifying" : "uploading"; color = "#0369a1"; }
     else if (j.status === "done") { icon = "✓"; label = "done"; color = "#16a34a"; }
     else if (j.status === "interrupted") { icon = "⚠️"; label = "interrupted (server restart)"; color = "#d97706"; }
     else { icon = "✗"; label = "failed"; color = "#dc2626"; }
+
+    // Time display: active jobs show how long they've been running.
+    // Terminal jobs show how long the upload took + when it ended.
+    let timeHtml;
+    const startedAt = j.started_at || 0;
+    const endedAt = j.ended_at || 0;
+    if (j.status === "queued" || j.status === "running") {
+      const elapsed = now - startedAt;
+      timeHtml = `<span style="color:#6b7280" title="started at ${escapeHtml(fmtAbsTime(startedAt))}">running for ${fmtDur(elapsed)}</span>`;
+    } else if (endedAt > startedAt) {
+      const duration = endedAt - startedAt;
+      const ago = now - endedAt;
+      timeHtml = `<span style="color:#6b7280" title="started ${escapeHtml(fmtAbsTime(startedAt))} · ended ${escapeHtml(fmtAbsTime(endedAt))}">took ${fmtDur(duration)} · ${fmtAgo(ago)}</span>`;
+    } else {
+      timeHtml = `<span style="color:#6b7280" title="started at ${escapeHtml(fmtAbsTime(startedAt))}">${fmtAgo(now - startedAt)}</span>`;
+    }
+
     const errPart = j.error ? `<div style="color:#dc2626;margin-top:2px;font-size:11px">→ ${escapeHtml(j.error.slice(0, 200))}</div>` : "";
     return `<div style="padding:4px 0;border-top:1px solid #dbeafe">
       <span style="color:${color};font-weight:600">${icon} ${label}</span>
@@ -4302,7 +4331,7 @@ function renderJobs(jobs) {
       <span style="margin:0 6px;color:#6b7280">·</span>
       <span style="color:#6b7280">${escapeHtml(j.remote || "")}</span>
       <span style="margin:0 6px;color:#6b7280">·</span>
-      <span style="color:#6b7280">${age}</span>
+      ${timeHtml}
       ${errPart}
     </div>`;
   }).join("");
