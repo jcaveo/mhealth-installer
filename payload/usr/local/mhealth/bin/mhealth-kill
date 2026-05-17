@@ -2019,26 +2019,33 @@ HTML = r"""<!DOCTYPE html>
   <div id="pane-cloudsetup" class="pane">
     <h2 style="margin:0 0 6px;font-size:17px">Cloud Setup
       <span style="font-weight:400;color:var(--muted);font-size:12px;margin-left:8px">
-        · Configure one or more cloud providers. Cloud Archive (in Space tab) uses these remotes to store and restore files.
+        · All free-tier cloud providers — configure as many as you want. The Archive tab uses these to store and restore files.
       </span>
     </h2>
 
-    <!-- Setup wizard: full version, lives here -->
+    <!-- Install rclone (shows only if rclone is missing) -->
     <div id="cloudSetup" style="display:none;background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:14px 18px;margin:14px 0;color:#7c2d12">
       <div id="cloudSetupBody"></div>
       <div style="margin-top:10px"><button onclick="refreshCloud()">Re-check</button></div>
     </div>
 
-    <!-- Full remotes panel (with usage bars) -->
-    <div id="cloudRemotes" style="display:none;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 16px;margin:14px 0;font-size:13px"></div>
+    <!-- Provider checklist toolbar -->
+    <div id="cloudOverview" style="display:none;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin:14px 0;font-size:13px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+      <span><b>Configured:</b> <span id="cloudOverviewCounts">0 of 0</span></span>
+      <span><b>Total free capacity:</b> <span id="cloudOverviewCapacity">—</span></span>
+      <span><b>Total used:</b> <span id="cloudOverviewUsed">—</span></span>
+      <button onclick="refreshCloud()">Re-check all</button>
+    </div>
 
-    <!-- After-configured: how to add more / where to use -->
+    <!-- Always-visible providers grid -->
+    <div id="providersGrid" style="display:none;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin:14px 0"></div>
+
+    <!-- Inline recipe expansion area -->
+    <div id="providerRecipe" style="display:none"></div>
+
+    <!-- Helpful hint shown once at least one provider is configured -->
     <div id="cloudSetupReady" style="display:none;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:12px 16px;margin:14px 0;color:#166534;font-size:13px;line-height:1.6">
-      <b>✓ Cloud is ready.</b><br>
-      Head to the <b>Space</b> tab → scan any folder under your home → use <b>☁️ Archive selected</b> to send cold assets to your remote. Restore from the <b>Archived items</b> panel anytime.
-      <div style="margin-top:8px;font-size:12px;color:#15803d">
-        To add another provider, run <code>rclone config</code> in Terminal and click Re-check below, or scroll up and pick another card.
-      </div>
+      <b>✓ Cloud is ready.</b> Head to the <b>Archive</b> tab → scan any folder → use <b>☁️ Archive selected</b> to send cold assets. Restore from the Archived items panel anytime.
     </div>
   </div>
 
@@ -2774,10 +2781,59 @@ Confirm password: ********
 Edit advanced config? n
 Keep this "mega" remote? y
 n/s/q> q`))}
-    ${step(4, "Click Re-check below", `Your remote should appear in the Remotes panel.`)}
+    ${step(4, "Click Re-check below", `Your remote should appear above.`)}
+    <div style="text-align:right;margin-top:8px"><button onclick="refreshCloud()" style="background:#f97316;color:#fff;border:none;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer">Re-check</button></div>
+  </div>`,
+
+  box: oauthRecipe("Box", "box", 7, "https://box.com"),
+  dropbox: oauthRecipe("Dropbox", "dropbox", 15, "https://dropbox.com"),
+  onedrive: oauthRecipe("OneDrive", "onedrive", 42, "https://onedrive.live.com"),
+  pcloud: oauthRecipe("pCloud", "pcloud", 46, "https://pcloud.com"),
+  storj: `<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:14px;margin-top:10px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h4 style="margin:0;color:#111827;font-size:14px">Storj setup</h4>
+      <button onclick="document.getElementById('providerRecipe').style.display='none'" style="background:transparent;border:none;color:#6b7280;cursor:pointer;font-size:18px;padding:0 4px">×</button>
+    </div>
+    ${step(1, "Sign up free at Storj", `<a href="https://storj.io/signup" target="_blank" rel="noopener" style="color:#f97316">storj.io/signup</a> — 25 GB free + 25 GB egress/month.`)}
+    ${step(2, "Create a project + access grant", `In the Storj dashboard: New Project → name it <code>mhealth-archive</code>. Then <b>Access Grants → Create Access Grant</b>. Permissions: All. Buckets: All. Save the <b>satellite</b> + <b>API key</b> + <b>passphrase</b>.`)}
+    ${step(3, "Open Terminal and run", codeBlockWithCopy("rclone config"))}
+    ${step(4, "Answer the prompts", codeBlockWithCopy(`n/s/q>  n
+name>   storj
+Storage> 58
+provider> 1
+access_grant> <paste your access grant>
+Edit advanced config? n
+Keep this "storj" remote? y
+n/s/q> q`))}
+    ${step(5, "Click Re-check below", `Your remote should appear above.`)}
     <div style="text-align:right;margin-top:8px"><button onclick="refreshCloud()" style="background:#f97316;color:#fff;border:none;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer">Re-check</button></div>
   </div>`,
 };
+
+// Generic OAuth-based recipe (works for Box/Dropbox/OneDrive/pCloud — they all
+// share the "auto config opens browser → click allow → done" pattern)
+function oauthRecipe(displayName, rcloneType, storageNumber, signupUrl) {
+  return `<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:14px;margin-top:10px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h4 style="margin:0;color:#111827;font-size:14px">${displayName} setup</h4>
+      <button onclick="document.getElementById('providerRecipe').style.display='none'" style="background:transparent;border:none;color:#6b7280;cursor:pointer;font-size:18px;padding:0 4px">×</button>
+    </div>
+    ${step(1, "Have an account ready", `Sign up free at <a href="${signupUrl}" target="_blank" rel="noopener" style="color:#f97316">${signupUrl.replace(/^https?:\/\//,'')}</a> if you don't have one.`)}
+    ${step(2, "Open Terminal and run", codeBlockWithCopy("rclone config"))}
+    ${step(3, "Answer the prompts", codeBlockWithCopy(`n/s/q>  n
+name>   ${rcloneType}
+Storage> ${storageNumber}
+client_id>
+client_secret>
+${rcloneType === "onedrive" ? "region> 1\n" : ""}Edit advanced config? n
+Use auto config? y
+                          ← browser opens → sign in → grant access → "Success!"
+${rcloneType === "onedrive" ? "Type of connection? 1\nDrive ID list>\nIs that okay? y\n" : ""}Keep this "${rcloneType}" remote? y
+n/s/q> q`))}
+    ${step(4, "Click Re-check below", `Your remote should appear above.`)}
+    <div style="text-align:right;margin-top:8px"><button onclick="refreshCloud()" style="background:#f97316;color:#fff;border:none;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer">Re-check</button></div>
+  </div>`;
+}
 
 function fmtBytes(n) {
   if (n == null) return "—";
@@ -2803,10 +2859,94 @@ async function refreshCloud() {
   }
 }
 
+// All well-known free-tier providers we support recipes for.
+// `match` is a function that, given an rclone remote {name, type}, returns true if that remote IS this provider.
+const PROVIDER_CATALOG = [
+  { id: "r2",       name: "Cloudflare R2",   free_gb: 10, tagline: "Zero egress fees",
+    blurb: "Best technical fit — restores cost nothing at any size. S3-compatible.",
+    match: r => r.type === "s3" || /r2/i.test(r.name) },
+  { id: "mega",     name: "Mega",            free_gb: 20, tagline: "Biggest free tier",
+    blurb: "20 GB free per account. Encryption-first (slightly slower up/down).",
+    match: r => r.type === "mega" },
+  { id: "gdrive",   name: "Google Drive",    free_gb: 15, tagline: "Easiest setup",
+    blurb: "OAuth in browser — no tokens to copy. 3 min to configure.",
+    match: r => r.type === "drive" },
+  { id: "box",      name: "Box",             free_gb: 10, tagline: "Personal free tier",
+    blurb: "10 GB free with file-size limit (250 MB per file).",
+    match: r => r.type === "box" },
+  { id: "dropbox",  name: "Dropbox",         free_gb: 2,  tagline: "Ubiquitous",
+    blurb: "Small free tier (2 GB) but everyone has an account.",
+    match: r => r.type === "dropbox" },
+  { id: "onedrive", name: "OneDrive",        free_gb: 5,  tagline: "Microsoft",
+    blurb: "5 GB free with personal Microsoft account.",
+    match: r => r.type === "onedrive" },
+  { id: "pcloud",   name: "pCloud",          free_gb: 10, tagline: "Swiss-based",
+    blurb: "10 GB free, optional lifetime plans, decent speeds.",
+    match: r => r.type === "pcloud" },
+  { id: "storj",    name: "Storj",           free_gb: 25, tagline: "Decentralized",
+    blurb: "25 GB free + 25 GB egress/mo. Distributed storage network.",
+    match: r => r.type === "storj" },
+];
+
+// Render the providers grid: configured ones show usage; unconfigured show "Set up →"
+function renderProvidersGrid() {
+  const gridEl = document.getElementById("providersGrid");
+  if (!gridEl) return;
+  const remotes = cloudState.remotes || [];
+  const html = PROVIDER_CATALOG.map(p => {
+    const matched = remotes.find(r => p.match(r));
+    const configured = !!matched;
+    const cardBorder = configured ? "#86efac" : "#e5e7eb";
+    const headerBg = configured ? "#d1fae5" : "#f9fafb";
+    const statusBadge = configured
+      ? '<span style="background:#16a34a;color:#fff;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600">✓ CONFIGURED</span>'
+      : '<span style="background:#fed7aa;color:#7c2d12;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600">TO DO</span>';
+    let bodyHtml;
+    if (configured) {
+      const has = matched.total != null;
+      const pct = has && matched.total > 0 ? ((matched.used || 0) / matched.total * 100).toFixed(1) : null;
+      const bar = has
+        ? `<div style="height:6px;background:#e5e7eb;border-radius:3px;margin:6px 0;overflow:hidden"><div style="height:100%;width:${pct||0}%;background:#16a34a"></div></div>`
+        : "";
+      const usage = has
+        ? `<div style="font-size:11px;color:#15803d">${fmtBytes(matched.used)} used · ${fmtBytes(matched.free)} free of ${fmtBytes(matched.total)}</div>`
+        : '<div style="font-size:11px;color:#6b7280">Usage info unavailable for this backend</div>';
+      bodyHtml = `
+        <div style="font-size:11px;color:#6b7280">Remote name: <code>${escapeHtml(matched.name)}</code></div>
+        ${bar}${usage}`;
+    } else {
+      bodyHtml = `
+        <div style="font-size:11px;color:#6b7280;margin:4px 0 8px;min-height:30px">${escapeHtml(p.blurb)}</div>
+        <button onclick="showRecipe('${p.id}')" style="width:100%;padding:6px;border:1px solid var(--accent);background:#fff;color:var(--accent);border-radius:6px;cursor:pointer;font-weight:500">Set up →</button>`;
+    }
+    return `<div style="border:2px solid ${cardBorder};border-radius:10px;overflow:hidden">
+      <div style="padding:8px 12px;background:${headerBg};display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <div style="font-weight:600;font-size:13px">${escapeHtml(p.name)}</div>
+          <div style="font-size:10px;color:#6b7280">${p.free_gb} GB free · ${escapeHtml(p.tagline)}</div>
+        </div>
+        ${statusBadge}
+      </div>
+      <div style="padding:10px 12px">${bodyHtml}</div>
+    </div>`;
+  }).join("");
+  gridEl.innerHTML = html;
+  gridEl.style.display = "grid";
+
+  // Overview stats
+  const configuredCount = PROVIDER_CATALOG.filter(p => remotes.find(r => p.match(r))).length;
+  const totalFree = remotes.reduce((s, r) => s + (r.free != null ? r.free : 0), 0);
+  const totalUsed = remotes.reduce((s, r) => s + (r.used != null ? r.used : 0), 0);
+  document.getElementById("cloudOverview").style.display = "flex";
+  document.getElementById("cloudOverviewCounts").textContent = `${configuredCount} of ${PROVIDER_CATALOG.length}`;
+  document.getElementById("cloudOverviewCapacity").textContent = totalFree > 0 ? fmtBytes(totalFree) + " across configured remotes" : "—";
+  document.getElementById("cloudOverviewUsed").textContent = totalUsed > 0 ? fmtBytes(totalUsed) : "0 B";
+}
+
 function renderCloudHeader() {
   const setupEl = document.getElementById("cloudSetup");
   const setupBody = document.getElementById("cloudSetupBody");
-  const remotesEl = document.getElementById("cloudRemotes");
+  const remotesEl = document.getElementById("cloudRemotes");  // may be null in new layout
   const remoteSelect = document.getElementById("archiveRemote");
   // Compact versions on the Space tab
   const hintEl = document.getElementById("cloudSetupHint");
@@ -2824,56 +2964,41 @@ function renderCloudHeader() {
   if (!cloudState.rclone_available) {
     setupEl.style.display = "block";
     setupBody.innerHTML = `
-      <h3 style="margin:0 0 12px;font-size:15px;color:#7c2d12">Step 1 of 2 — Install rclone</h3>
+      <h3 style="margin:0 0 12px;font-size:15px;color:#7c2d12">Step 1 — Install rclone</h3>
       <div style="margin-bottom:8px">Open Terminal and run:</div>
       ${codeBlockWithCopy("brew install rclone")}
       <div style="font-size:12px;margin-top:10px;color:#92400e">
         Don't have Homebrew? Install it first from <a href="https://brew.sh" target="_blank" rel="noopener" style="color:#92400e;font-weight:600">brew.sh</a>.
       </div>
       <div style="margin-top:14px;font-size:12px;color:#7c2d12">
-        rclone is a single command-line tool that bridges to 30+ cloud providers. Free, open-source, no account needed for the tool itself.
+        rclone bridges to 30+ cloud providers. Free, open-source, no account needed for the tool itself. Once installed, all providers below become configurable.
       </div>`;
-    remotesEl.style.display = "none";
+    if (document.getElementById("providersGrid")) document.getElementById("providersGrid").style.display = "none";
+    if (document.getElementById("cloudOverview")) document.getElementById("cloudOverview").style.display = "none";
+    if (remoteSelect) remoteSelect.innerHTML = "";
     hideReady();
     showHint("☁️ rclone isn't installed. Cloud Archive needs it — go to Cloud Setup tab to install.");
     return;
   }
-  if ((cloudState.remotes || []).length === 0) {
-    setupEl.style.display = "block";
-    setupBody.innerHTML = `
-      <h3 style="margin:0 0 6px;font-size:15px;color:#7c2d12">Step 2 of 2 — Pick a cloud provider</h3>
-      <div style="font-size:12px;color:#92400e;margin-bottom:14px">Click a provider below for step-by-step setup. You only need one. You can add more later.</div>
-      <div id="providerCards" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:12px">
-        ${providerCard("r2",     "Cloudflare R2",  "Best for heavy use",  "10 GB free",  "Zero egress fees — restores cost nothing. Best technical fit, ~10 min setup.")}
-        ${providerCard("gdrive", "Google Drive",   "Easiest setup",       "15 GB free",  "OAuth in browser — fastest setup, ~3 min. No tokens to copy.")}
-        ${providerCard("mega",   "Mega",           "Most free space",     "20 GB free",  "Just email + password. Slower up/down (encryption-first), ~3 min setup.")}
-      </div>
-      <div id="providerRecipe" style="display:none"></div>`;
-    remotesEl.style.display = "none";
-    remoteSelect.innerHTML = "";
+
+  // rclone is installed — hide install step, show always-visible providers grid
+  setupEl.style.display = "none";
+  renderProvidersGrid();
+
+  const configuredRemotes = cloudState.remotes || [];
+  if (configuredRemotes.length === 0) {
+    if (remoteSelect) remoteSelect.innerHTML = "";
     hideReady();
-    showHint("☁️ No cloud remote configured yet. You can still delete regenerable items here, but archiving needs setup.");
+    showHint("☁️ No cloud remote configured yet. Pick a provider in Cloud Setup tab.");
     return;
   }
 
-  // Have rclone + remotes — show summary + populate select
-  setupEl.style.display = "none";
-  const lines = cloudState.remotes.map(r => {
-    const has = r.total != null;
-    const pct = has && r.total > 0 ? ((r.used || 0) / r.total * 100).toFixed(1) : null;
-    const bar = has ? `<div style="display:inline-block;vertical-align:middle;width:140px;height:8px;background:#e5e7eb;border-radius:4px;margin:0 8px;overflow:hidden"><div style="height:100%;width:${pct||0}%;background:var(--accent)"></div></div>` : "";
-    const usage = has
-      ? `${fmtBytes(r.used)} used · ${fmtBytes(r.free)} free of ${fmtBytes(r.total)}${pct?' ('+pct+'%)':''}`
-      : '<span style="color:var(--muted)">usage info unavailable for this backend</span>';
-    return `<div style="margin:4px 0"><b>${escapeHtml(r.name)}</b> <span style="color:var(--muted);font-size:11px">[${escapeHtml(r.type)}]</span> ${bar} ${usage}</div>`;
-  });
-  remotesEl.innerHTML = "<b>Configured remotes</b>" + lines.join("");
-  remotesEl.style.display = "block";
+  // Have rclone + at least one remote — show ready hint + populate archive select
   showReady();
 
-  // Compact remotes line for Space tab
+  // Compact remotes line for Archive tab
   if (compactRemotesEl) {
-    const summary = cloudState.remotes.map(r => {
+    const summary = configuredRemotes.map(r => {
       const has = r.total != null;
       const u = has ? ` (${fmtBytes(r.used)}/${fmtBytes(r.total)})` : "";
       return `<b>${escapeHtml(r.name)}</b>${u}`;
@@ -2883,11 +3008,13 @@ function renderCloudHeader() {
   }
   hideHint();
 
-  // Populate archive-target select
-  const current = remoteSelect.value;
-  remoteSelect.innerHTML = cloudState.remotes
-    .map(r => `<option value="${escapeHtml(r.name)}">${escapeHtml(r.name)}</option>`).join("");
-  if (current && cloudState.remotes.find(r => r.name === current)) remoteSelect.value = current;
+  // Populate archive-target select (used by the Archive tab scanner)
+  if (remoteSelect) {
+    const current = remoteSelect.value;
+    remoteSelect.innerHTML = configuredRemotes
+      .map(r => `<option value="${escapeHtml(r.name)}">${escapeHtml(r.name)}</option>`).join("");
+    if (current && configuredRemotes.find(r => r.name === current)) remoteSelect.value = current;
+  }
 }
 
 function renderArchives() {
@@ -2975,10 +3102,21 @@ async function scanFolder() {
   if (!path) { alert("Enter a path to scan, click 📂 Browse, or pick a preset."); return; }
   const el = document.getElementById("scanStatus");
   el.textContent = "Scanning…"; el.className = "status";
+  hideTccHelp();
   try {
     const r = await fetch("/cloud/scan?path=" + encodeURIComponent(path));
     const j = await r.json();
-    if (!j.ok && !j.items) { el.textContent = "Error: " + j.error; el.className = "status err"; return; }
+    if (!j.ok && !j.items) {
+      el.textContent = "Error";
+      el.className = "status err";
+      // TCC = "Operation not permitted" almost always. Show the help card.
+      if (/permission denied|not permitted|TCC|privacy/i.test(j.error || "")) {
+        showTccHelp(path, j.error);
+      } else {
+        alert("Scan failed: " + j.error);
+      }
+      return;
+    }
     scanResult = j;
     renderScanResult();
     const errPart = (j.errors && j.errors.length) ? ` (${j.errors.length} path failed)` : "";
@@ -2988,6 +3126,80 @@ async function scanFolder() {
     el.textContent = "Failed: " + e.message;
     el.className = "status err";
   }
+}
+
+function hideTccHelp() {
+  const el = document.getElementById("tccHelp");
+  if (el) el.style.display = "none";
+}
+
+async function showTccHelp(path, rawError) {
+  let el = document.getElementById("tccHelp");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "tccHelp";
+    el.style.cssText = "background:#fff7ed;border:2px solid #fb923c;border-radius:10px;padding:16px 20px;margin:14px 0;color:#7c2d12";
+    // Insert above the scan table area, after the Browse toolbar
+    const anchor = document.getElementById("scanTable");
+    anchor.parentNode.insertBefore(el, anchor);
+  }
+  // Get the actual python path from the server
+  let pythonPath = "/usr/bin/python3";
+  try {
+    const r = await fetch("/system/open-privacy-settings");
+    const j = await r.json();
+    if (j.python_path) pythonPath = j.python_path;
+  } catch {}
+  el.innerHTML = `
+    <h3 style="margin:0 0 10px;font-size:15px;color:#7c2d12">🔒 macOS is blocking access to <code>${escapeHtml(path)}</code></h3>
+    <p style="margin:0 0 12px;font-size:13px">macOS protects <b>Documents</b>, <b>Desktop</b>, and <b>Downloads</b> behind a privacy permission. You need to grant <b>Full Disk Access</b> to the Python interpreter that runs mhealth.</p>
+    <ol style="margin:0 0 12px 22px;padding:0;font-size:13px;line-height:1.7">
+      <li>System Settings just opened (or click <button onclick="openPrivacySettings()" style="padding:2px 10px;border-radius:4px;border:1px solid #fb923c;background:#fff;cursor:pointer">Open Privacy Settings</button>)</li>
+      <li>Scroll to <b>Full Disk Access</b></li>
+      <li>Click the <b>+</b> button</li>
+      <li>Press <b>Cmd+Shift+G</b>, paste this path, and hit Enter:
+        <div style="display:flex;gap:6px;margin:6px 0;align-items:center">
+          <code id="pythonPath" style="flex:1;padding:6px 10px;background:#fff;border:1px solid #fed7aa;border-radius:4px;font-size:12px;user-select:all">${escapeHtml(pythonPath)}</code>
+          <button onclick="copyTextToClipboard('${escapeHtml(pythonPath)}', this)" style="padding:4px 10px;border-radius:4px;border:1px solid #fb923c;background:#fff;cursor:pointer">Copy</button>
+        </div>
+      </li>
+      <li>Select <b>python3</b> in the file picker and click <b>Open</b></li>
+      <li>Make sure the toggle next to it is <b>ON</b></li>
+      <li>Come back and click <button onclick="restartServerAndRescan('${escapeHtml(path)}')" style="padding:4px 10px;border-radius:4px;border:1px solid #fb923c;background:#fb923c;color:#fff;cursor:pointer">Restart server &amp; rescan</button></li>
+    </ol>
+    <details style="font-size:12px;color:#92400e;margin-top:8px">
+      <summary style="cursor:pointer">Why? + raw error</summary>
+      <p style="margin:6px 0">macOS's TCC (Transparency, Consent &amp; Control) blocks background services from reading Documents/Desktop/Downloads without explicit user consent. The mhealth server runs under launchd, so the consent must be granted to <code>python3</code> directly, not to mhealth.</p>
+      <p style="margin:6px 0"><b>Raw error:</b> ${escapeHtml(rawError || "")}</p>
+    </details>
+  `;
+  el.style.display = "block";
+  // Auto-trigger Privacy Settings (it'll noop if user dismissed and re-tried)
+  fetch("/system/open-privacy-settings").catch(() => {});
+}
+
+async function openPrivacySettings() {
+  await fetch("/system/open-privacy-settings");
+}
+
+async function copyTextToClipboard(text, btn) {
+  try {
+    await navigator.clipboard.writeText(text);
+    const orig = btn.textContent;
+    btn.textContent = "✓ Copied";
+    setTimeout(() => { btn.textContent = orig; }, 1500);
+  } catch (e) {
+    btn.textContent = "Copy failed";
+  }
+}
+
+async function restartServerAndRescan(path) {
+  // We can't restart ourselves from the browser, but we can tell the user how.
+  // For now: just retry the scan — if they've granted TCC, the cached subprocess
+  // doesn't help (already running). Need a manual restart via Terminal.
+  alert("To restart, open Terminal and run:\\n\\n  launchctl kickstart -k \"gui/$(id -u)/com.mhealth.server\"\\n\\nThen re-click Scan. (If your launch agent is named com.jc.mhealth-server instead, use that label.)");
+  document.getElementById("scanPath").value = path;
+  setTimeout(() => scanFolder(), 500);
 }
 
 function renderScanResult() {
@@ -3703,6 +3915,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, json.dumps(scan_home_overview()).encode(), "application/json")
         elif self.path == "/cloud/pick-folder":
             self._send(200, json.dumps(pick_folder()).encode(), "application/json")
+        elif self.path == "/system/open-privacy-settings":
+            # Open System Settings → Privacy & Security → Full Disk Access
+            try:
+                subprocess.Popen([
+                    "open",
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+                ])
+                ok = True
+            except Exception:
+                ok = False
+            self._send(200, json.dumps({"ok": ok, "python_path": sys.executable}).encode(), "application/json")
         elif self.path == "/snooze":
             self._send(200, json.dumps(snooze_status()).encode(), "application/json")
         elif self.path == "/ping":

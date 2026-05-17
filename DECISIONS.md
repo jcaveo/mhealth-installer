@@ -4,6 +4,36 @@ Append-only per CLAUDE.md. New entries on top.
 
 ---
 
+## 2026-05-17 — Cloud Setup: always-visible providers grid + TCC help card
+
+**Status:** completed
+**Changes:**
+
+**1. Providers to-do grid (Cloud Setup tab):**
+- `PROVIDER_CATALOG` lists 8 well-known free-tier providers: R2, Mega, Drive, Box, Dropbox, OneDrive, pCloud, Storj
+- Always-visible card grid; each card shows free-tier size + tagline + blurb
+- Configured providers: green border, "✓ CONFIGURED" badge, usage bar with `Used / Free / Total`
+- Unconfigured: amber "TO DO" badge, "Set up →" button that expands recipe inline
+- Overview row above grid: "Configured: 1 of 8 · Total free capacity: X · Total used: Y"
+- New OAuth recipes (Box / Dropbox / OneDrive / pCloud) via shared `oauthRecipe()` helper
+- Storj recipe (access-grant based, different from OAuth)
+
+**2. TCC error help card (Archive tab):**
+- When scan fails with permission-denied, replace the old text error with a step-by-step orange card
+- Auto-opens System Settings → Privacy & Security → Full Disk Access via `x-apple.systempreferences:` URL scheme
+- Shows the exact `sys.executable` path with a Copy button (pasted via Cmd+Shift+G in the file picker)
+- New endpoint `GET /system/open-privacy-settings` triggers the macOS settings URL + returns python path
+- "Restart server & rescan" button shows the exact `launchctl kickstart` command and auto-retries
+
+**Why:**
+- User noted Mega-only Cloud Setup hid all other options after first setup — wanted ALL free providers visible as a to-do list so devs see backup options
+- User hit TCC blocking ~/Desktop scan and wanted clear remediation steps
+
+**Pending (deferred to next pass):**
+- Folder drill-down with breadcrumbs in Archive tab (clicking a folder navigates into it)
+
+---
+
 ## 2026-05-17 — Inactive project detection + iOS/Android cache categories
 
 **Status:** completed
