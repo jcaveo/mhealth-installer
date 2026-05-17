@@ -4,6 +4,22 @@ Append-only per CLAUDE.md. New entries on top.
 
 ---
 
+## 2026-05-17 — Revert: keep activity logger ON by default (tab still hidden)
+
+**Status:** completed
+**Changes:**
+- `mhealth-setup` reverted to always install all 3 launchd jobs (watcher + **activity** + server) — activity logger DOES run by default on every install, collecting `~/Library/Logs/mhealth-activity.csv` every 60 s
+- Time Spent tab still hidden by default (unchanged from previous decision); revealed only when `MHEALTH_ENABLE_TIME_SPENT=1` is set
+- INSTALL.md §5 — new "Data collection (transparent disclosure)" section: explains exactly what's recorded, where, the retention, and how to disable the logger entirely. Lists both log files with their auto-prune (15 days) and explicit `launchctl bootout` / `rm` commands.
+- TODO_HIDDEN_FEATURES.md updated to reflect "data collected, UI hidden" model + flagged the optics trade-off explicitly
+
+**Why (user's call):**
+- User explicitly asked: keep collecting data on teammate Macs, just hide the tab. Rationale: future-proof so the feature can be enabled per-user later without losing historical data.
+
+**Concern raised in chat + recorded here:** A teammate could find `mhealth-activity.csv` growing and feel surveilled even though the data never leaves their machine. Transparent disclosure in INSTALL.md is the mitigation. Revisit if a teammate ever flags it.
+
+---
+
 ## 2026-05-17 — Time Spent disabled by default + per-site minutes + layout reflow
 
 **Status:** completed

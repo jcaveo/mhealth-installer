@@ -22,17 +22,20 @@ mkdir -p "$LAUNCH_DIR"
 mkdir -p "$HOME/Library/Logs"
 mkdir -p "$HOME/Library/Application Support/mac-health-watcher"
 
-# Time Spent feature is OFF by default (privacy). Set MHEALTH_ENABLE_TIME_SPENT=1
-# in your environment when running mhealth-setup to include the activity logger
-# AND surface the Time Spent tab in the dashboard.
-JOBS="watcher server"
-if [ "${MHEALTH_ENABLE_TIME_SPENT:-0}" = "1" ]; then
-  JOBS="watcher activity server"
-  echo "→ MHEALTH_ENABLE_TIME_SPENT=1 — activity logger will be installed"
-else
-  echo "→ Time Spent feature disabled (default). Activity logger NOT installed."
-  echo "  To enable later, run:  MHEALTH_ENABLE_TIME_SPENT=1 mhealth-setup"
-fi
+# All three jobs install by default:
+#   watcher  — 5-min health sampler (notifications)
+#   activity — 1-min foreground-app / browser-tab / idle logger to ~/Library/Logs/mhealth-activity.csv
+#   server   — always-on dashboard at http://127.0.0.1:8765/
+#
+# The Time Spent TAB in the dashboard is hidden by default (privacy optics).
+# To reveal the tab, set MHEALTH_ENABLE_TIME_SPENT=1 (this also adds the env var
+# to the server's plist so the server tells the UI to show the tab).
+#
+# To DISABLE data collection entirely, run:
+#   launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.mhealth.activity.plist
+#   rm ~/Library/LaunchAgents/com.mhealth.activity.plist
+# Data file:  ~/Library/Logs/mhealth-activity.csv  (rm it any time)
+JOBS="watcher activity server"
 
 for job in $JOBS; do
   src="$TEMPLATE_DIR/com.mhealth.${job}.plist"

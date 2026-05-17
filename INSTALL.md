@@ -185,7 +185,34 @@ Then:
 
 ---
 
-## 5. Troubleshooting
+## 5. Data collection (transparent disclosure)
+
+mhealth runs entirely locally — **the server binds to `127.0.0.1` only, never makes outbound network calls, no telemetry, no phone-home**. But it does record a few things to local files so the dashboard can show useful info:
+
+| Logger | What it records | Where | How often | Auto-prune |
+|---|---|---|---|---|
+| `mac-health-watcher` | Load avg, free RAM, compressor, swap, disk %, top processes | `~/Library/Logs/mac-health-watcher.log` | every 5 min | 15 days |
+| `mhealth-activity` | Frontmost app, window title, idle seconds, current browser tab title + URL | `~/Library/Logs/mhealth-activity.csv` | every 60 s | 15 days |
+
+**Nothing leaves your Mac.** You can inspect either file with `cat`, delete them any time, or stop the collectors entirely:
+
+```bash
+# Disable activity logger
+launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.mhealth.activity.plist
+rm ~/Library/LaunchAgents/com.mhealth.activity.plist
+rm ~/Library/Logs/mhealth-activity.csv
+
+# Disable health watcher
+launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.mhealth.watcher.plist
+rm ~/Library/LaunchAgents/com.mhealth.watcher.plist
+rm ~/Library/Logs/mac-health-watcher.log
+```
+
+The Time Spent dashboard tab (which would visualize the activity log) is hidden by default. To enable it for your account: `MHEALTH_ENABLE_TIME_SPENT=1 mhealth-setup`.
+
+---
+
+## 6. Troubleshooting
 
 **"refused to connect" at 8765**
 The launchd service may not be loaded. Re-load it:
@@ -210,7 +237,7 @@ Try the older form: `launchctl unload` / `launchctl load`. macOS 12+ should acce
 
 ---
 
-## 6. Where everything lives
+## 7. Where everything lives
 
 - Scripts: `/usr/local/mhealth/bin/`
 - CLI symlinks: `/usr/local/bin/{mhealth,mhealth-kill,mhealth-activity,mac-health-watcher,mhealth-setup,mhealth-uninstall}`
@@ -225,6 +252,6 @@ All user data is local. The only network egress is rclone uploads to whichever r
 
 ---
 
-## 7. Questions / problems
+## 8. Questions / problems
 
 Ping JC. Common sticking points are Gatekeeper (use right-click → Open), TCC permissions (grant Full Disk Access to python3), and the rclone OAuth dance (auto-config opens a browser — if that fails, pick "n" at "Use auto config?" and follow the manual URL flow).

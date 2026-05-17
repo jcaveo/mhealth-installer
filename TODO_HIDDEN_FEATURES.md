@@ -4,25 +4,37 @@ Features that exist in the codebase but are disabled by default in distributed i
 
 ---
 
-## 🔒 Time Spent — disabled by default
+## 🔒 Time Spent tab — hidden by default (data IS collected)
 
-**Status:** code in place, tab hidden, activity logger not loaded.
+**Status:** activity logger runs by default on every install (data is collected to `~/Library/Logs/mhealth-activity.csv`). The Time Spent dashboard tab is hidden unless `MHEALTH_ENABLE_TIME_SPENT=1`.
 
-**What it does** (when enabled): tracks per-app foreground time, top browser hosts with visit count + active minutes, and top zsh commands. Data is **100% local** — written to `~/Library/Logs/mhealth-activity.csv`, never transmitted (server binds to 127.0.0.1 only).
+**Why this split:**
+- Collecting data preserves the option to enable the feature later for any user without losing historical data
+- Hiding the tab keeps the UX clean for teammates who don't need it
+- Data is **100% local** — `~/Library/Logs/mhealth-activity.csv`, never transmitted (server binds to 127.0.0.1 only, no telemetry, no egress)
+- Disclosed transparently in INSTALL.md §5 ("Data collection") with explicit instructions to disable the logger entirely if a user objects
 
-**Why disabled by default:**
-- Even though data never leaves the machine, a boss-distributed tool that tracks app/website/shell usage *looks like* surveillance to devs.
-- Optics override technical correctness here. Defaulting OFF means we never have to explain why we're tracking and devs never have to wonder.
+**How the tab is hidden:**
+1. The "Time Spent" tab `<div id="timeSpentTab">` has inline `style="display:none"`
+2. Server reads `MHEALTH_ENABLE_TIME_SPENT` env var and injects `<script>window.__ENABLE_TIME_SPENT__=true|false;</script>` before `</head>`
+3. Small JS on page load checks the flag and reveals the tab when true
 
-**How it's hidden:**
-1. `mhealth-setup` skips `com.mhealth.activity.plist` unless `MHEALTH_ENABLE_TIME_SPENT=1` is set in its environment → activity logger not loaded → CSV never grows.
-2. The "Time Spent" tab in the dashboard has `style="display:none"` and only reveals when the server sees `MHEALTH_ENABLE_TIME_SPENT=1`.
-
-**How to re-enable (per-user, opt-in):**
+**How to reveal the tab (per-user, opt-in):**
 ```bash
 MHEALTH_ENABLE_TIME_SPENT=1 mhealth-setup
 ```
-This loads the activity launchd job AND adds the env var to the server's plist so the tab appears in the dashboard.
+This adds the env var to the server's plist; the tab appears on next dashboard load.
+
+**How to stop the data collection entirely** (if a user objects):
+```bash
+launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.mhealth.activity.plist
+rm ~/Library/LaunchAgents/com.mhealth.activity.plist
+rm ~/Library/Logs/mhealth-activity.csv
+```
+Documented in INSTALL.md §5.
+
+**Concern flagged for future revisit:**
+A teammate could discover the growing CSV and feel surveilled even though the data never leaves their machine. The transparent disclosure in INSTALL.md mitigates this somewhat, but a clearer pattern would be: collect only when the tab is enabled. We chose not-quite-that to preserve historical data continuity if/when individual users opt in later. Trade-off accepted; revisit if a teammate raises it.
 
 **Before flipping the default to ON (future revisit):**
 - Document the data flow clearly in the welcome dialog
