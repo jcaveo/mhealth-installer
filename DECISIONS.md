@@ -4,6 +4,40 @@ Append-only per CLAUDE.md. New entries on top.
 
 ---
 
+## 2026-05-17 — Inactive project detection + iOS/Android cache categories
+
+**Status:** completed
+**Changes:**
+- `classify_folder`: for git-repo subfolders, runs `git log -1 --format=%ct` (3s timeout) and classifies by age:
+  - ≥ 180d: 🟢 ARCHIVE with reason "inactive — last commit Nd ago (>6 months). Likely safe to archive."
+  - ≥ 90d: 🟢 ARCHIVE "cold — last commit Nd ago (>3 months). Consider archiving."
+  - ≥ 30d: 🟡 CHECK "recent — last commit Nd ago. Confirm no untracked work first."
+  - < 30d: 🟡 CHECK "active — last commit Nd ago. Probably still in use."
+  - git missing/unreadable: CHECK "couldn't read history. Verify before archiving."
+- Added 8 new mobile-dev cache categories to DISK_CANDIDATES:
+  - `~/.gradle/caches` (Android/Kotlin/Java) — 🟢 SAFE
+  - `~/.gradle/wrapper` — 🟢 SAFE
+  - `~/Library/Caches/CocoaPods` — 🟢 SAFE
+  - `~/Library/Developer/Xcode/iOS DeviceSupport` — 🟡 CAUTION (debug symbols)
+  - `~/Library/Developer/Xcode/watchOS DeviceSupport` — 🟡 CAUTION
+  - `~/Library/Developer/CoreSimulator/Caches` — 🟢 SAFE
+  - `~/.android/build-cache` — 🟢 SAFE
+  - `~/.android/cache` — 🟢 SAFE
+- Each entry has `what_breaks` and `regen` text so iOS/Android devs see exactly what they're deleting before they click.
+
+**Why:**
+- User asked for older/untouched projects to surface as ARCHIVE candidates (not just CHECK like recent repos)
+- User flagged that iOS devs have specific pain with Gradle / SDKs / Xcode — now covered
+
+**Verified:** scanning `~/Documents/projects/` correctly tags aveo-finance-hub and mhealth-installer as "active — last commit 0d ago" (CHECK); inactive projects (when present) will tag as ARCHIVE.
+
+**Not added (intentionally):**
+- `~/Library/Developer/Xcode/Archives` — deployable artifacts, NOT cache. Never auto-suggest deletion.
+- `~/Library/Android/sdk` — actively-used SDK, NOT cache.
+- `~/Library/Developer/CoreSimulator/Devices` — user simulator state (installed apps, data). Don't bulk-delete; use `xcrun simctl delete unavailable` instead. May add as a separate special-case button later.
+
+---
+
 ## 2026-05-17 — Caches table: status text + filter chips + per-item progress
 
 **Status:** completed

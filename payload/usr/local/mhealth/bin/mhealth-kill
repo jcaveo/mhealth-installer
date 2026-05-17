@@ -410,6 +410,43 @@ DISK_CANDIDATES: list[dict] = [
      "desc": "Chrome's HTTP cache (separate from history/bookmarks/passwords).",
      "what_breaks": "First load of every website is slower; some sites may briefly show stale UI. Best to QUIT Chrome before deleting.",
      "regen": "Rebuilds automatically as you browse."},
+
+    # ── Mobile (Android / iOS) ────────────────────────────────────────────
+    {"path": "~/.gradle/caches", "category": "Gradle cache", "action": "delete-contents", "risk": "safe",
+     "desc": "Gradle dependency + build cache (Android, Kotlin, Java projects).",
+     "what_breaks": "Next Gradle build re-downloads dependencies and rebuilds caches.",
+     "regen": "5-15 min on next 'gradle build' depending on project size + network."},
+    {"path": "~/.gradle/wrapper", "category": "Gradle wrappers", "action": "delete-contents", "risk": "safe",
+     "desc": "Gradle wrapper distributions (one per version used).",
+     "what_breaks": "Next './gradlew' downloads the wrapper version it needs.",
+     "regen": "~100 MB per Gradle version on next build."},
+    {"path": "~/Library/Caches/CocoaPods", "category": "CocoaPods cache", "action": "delete-contents", "risk": "safe",
+     "desc": "Downloaded CocoaPods pod archives.",
+     "what_breaks": "Next 'pod install' re-downloads dependencies.",
+     "regen": "Minutes per project on next install."},
+    {"path": "~/Library/Developer/Xcode/iOS DeviceSupport", "category": "Xcode device support",
+     "action": "delete-contents", "risk": "caution",
+     "desc": "Xcode's debug symbols for specific iOS versions (one per iOS x.y.z used).",
+     "what_breaks": "You lose ability to debug apps on those specific iOS versions until Xcode re-downloads symbols.",
+     "regen": "Xcode re-fetches symbols (large) the next time you connect a device with that iOS. Slow first time."},
+    {"path": "~/Library/Developer/Xcode/watchOS DeviceSupport", "category": "Xcode watchOS support",
+     "action": "delete-contents", "risk": "caution",
+     "desc": "Xcode debug symbols for specific watchOS versions.",
+     "what_breaks": "Lose ability to debug on those watchOS versions until Xcode redownloads.",
+     "regen": "Xcode re-fetches on next watch connect."},
+    {"path": "~/Library/Developer/CoreSimulator/Caches", "category": "iOS Sim cache",
+     "action": "delete-contents", "risk": "safe",
+     "desc": "iOS Simulator runtime caches (NOT the simulator devices themselves).",
+     "what_breaks": "Simulator runtimes warm up slower on next launch.",
+     "regen": "Rebuilds automatically as simulators are used."},
+    {"path": "~/.android/build-cache", "category": "Android build cache", "action": "delete-contents", "risk": "safe",
+     "desc": "Android Studio incremental build cache.",
+     "what_breaks": "Next Android build takes longer (full rebuild instead of incremental).",
+     "regen": "Per-project on next Android build."},
+    {"path": "~/.android/cache", "category": "Android tool cache", "action": "delete-contents", "risk": "safe",
+     "desc": "Misc Android tooling caches (avd images partials, etc).",
+     "what_breaks": "Tooling re-fetches on demand.",
+     "regen": "On next use."},
 ]
 
 
@@ -714,6 +751,24 @@ SOURCE_EXTENSIONS = {
 }
 
 
+def _git_last_commit_age_days(repo: str) -> int | None:
+    """Days since the last commit on the current branch. Returns None if not a git
+    repo, no commits, or git unavailable. Bounded to 3 s so a stuck git can't hang scans."""
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        return None
+    try:
+        r = subprocess.run(
+            ["git", "-C", repo, "log", "-1", "--format=%ct"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        last_ts = int(r.stdout.strip())
+        return max(0, (int(time.time()) - last_ts) // 86400)
+    except Exception:
+        return None
+
+
 def _du_bytes(path: str, max_seconds: float = 8.0) -> int:
     """Walk a path and sum file sizes. Bounded by wall time to avoid hangs."""
     deadline = time.time() + max_seconds
@@ -801,8 +856,22 @@ def classify_folder(target: str) -> dict:
                 reason = "small asset, not worth archiving"
         elif is_dir:
             if os.path.isdir(os.path.join(full, ".git")):
-                category = "check"
-                reason = "git repo — check for uncommitted/unpushed work before archiving"
+                age = _git_last_commit_age_days(full)
+                if age is None:
+                    category = "check"
+                    reason = "git repo — couldn't read history. Verify before archiving."
+                elif age >= 180:
+                    category = "archive"
+                    reason = f"inactive — last commit {age}d ago (>6 months). Likely safe to archive."
+                elif age >= 90:
+                    category = "archive"
+                    reason = f"cold — last commit {age}d ago (>3 months). Consider archiving."
+                elif age >= 30:
+                    category = "check"
+                    reason = f"recent — last commit {age}d ago. Confirm no untracked work first."
+                else:
+                    category = "check"
+                    reason = f"active — last commit {age}d ago. Probably still in use."
             elif size_bytes >= 100 * 1024 * 1024:
                 category = "archive"
                 reason = f"large folder ({_fmt_bytes(size_bytes)}), no .git inside"
