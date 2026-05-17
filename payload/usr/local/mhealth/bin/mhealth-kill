@@ -2199,11 +2199,11 @@ HTML = r"""<!DOCTYPE html>
         </div>
         <div id="scanTotals" style="display:none;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:8px;font-size:13px"></div>
         <div id="scanActions" style="display:none;margin-bottom:8px">
-          <button onclick="deleteRegenerableSelected()" class="danger">🗑 Delete selected</button>
-          <label style="margin-left:14px">Archive to
+          <label>Archive to
             <select id="archiveRemote" style="padding:5px 8px;border:1px solid var(--line);border-radius:6px"></select>
           </label>
-          <button onclick="archiveSelected()">☁️ Archive selected</button>
+          <button onclick="archiveSelected()" class="primary" style="background:var(--accent);color:#fff;border-color:var(--accent)">☁️ Archive selected</button>
+          <button onclick="deleteRegenerableSelected()" class="danger" style="margin-left:14px">🗑 Delete selected</button>
         </div>
         <table id="scanTable" style="display:none">
           <colgroup>
