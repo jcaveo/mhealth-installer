@@ -1464,6 +1464,25 @@ def rearchive_entry(entry_id: str) -> dict:
     }
 
 
+def purge_orphans(remote: str) -> dict:
+    """Find orphans on `remote` (files in mhealth-archive that aren't in local
+    registry) and rclone purge each one. Returns counts + per-path results."""
+    r = reconcile_remote(remote)
+    if not r.get("ok"):
+        return r
+    orphans = r.get("orphans", [])
+    deleted = []
+    failed = []
+    for o in orphans:
+        target = f"{remote}:{o['remote_path']}"
+        rc, _, err = rclone_run(["purge", target], timeout=300)
+        if rc == 0:
+            deleted.append(o["remote_path"])
+        else:
+            failed.append({"path": o["remote_path"], "error": err[:200]})
+    return {"ok": True, "deleted": deleted, "failed": failed, "count_deleted": len(deleted), "count_failed": len(failed)}
+
+
 def archives_backfill_sizes() -> dict:
     """One-shot: for any archive with size_bytes <= 0, query rclone size and update."""
     with _ARCHIVES_LOCK:
@@ -3689,7 +3708,10 @@ async function reconcileWithCloud() {
     html += `<div style="color:#92400e">✓ ${j.registered.length} item(s) match registry · ☁️ ${orphans.length} orphan(s) on cloud · 📭 ${missing.length} missing on cloud</div>`;
 
     if (orphans.length > 0) {
-      html += `<div style="margin-top:10px"><b>Orphans on cloud (uploaded but not in registry):</b></div>`;
+      html += `<div style="margin-top:10px;display:flex;justify-content:space-between;align-items:center">
+        <b>Orphans on cloud (uploaded but not in registry):</b>
+        <button class="tiny danger" onclick="purgeAllOrphans('${escapeHtml(remote)}')" title="Bulk-delete every orphan listed below — useful when most are partial / interrupted uploads">🧹 Purge all ${orphans.length} orphan(s)</button>
+      </div>`;
       html += `<table style="width:100%;margin-top:6px;font-size:12px"><thead><tr><th style="text-align:left">Name</th><th class="num">Size</th><th></th></tr></thead><tbody>`;
       for (const o of orphans) {
         const sz = fmtBytes(o.size_bytes);
@@ -3703,7 +3725,7 @@ async function reconcileWithCloud() {
         </tr>`;
       }
       html += `</tbody></table>`;
-      html += `<div style="margin-top:6px;font-size:11px;color:#92400e">After importing, the file shows up in Archived items and you can Restore/Delete it normally.</div>`;
+      html += `<div style="margin-top:6px;font-size:11px;color:#92400e">Import: register an orphan as a real archive (so it shows in Archived items). Purge: bulk-delete all orphans from cloud (useful when they're partial uploads).</div>`;
     }
 
     if (missing.length > 0) {
@@ -3722,6 +3744,24 @@ async function reconcileWithCloud() {
     result.innerHTML = html;
   } catch (e) {
     result.innerHTML = `<span style="color:#dc2626">Reconcile failed: ${escapeHtml(e.message)}</span>`;
+  }
+}
+
+async function purgeAllOrphans(remote) {
+  if (!confirm(`Purge ALL orphan files from "${remote}" cloud?\n\nThis bulk-deletes every file currently on the cloud that isn't in your local registry. These are typically:\n  • Partial uploads from interrupted jobs\n  • Phantom dirs from failed copies\n\nLocal files are untouched.\n\nThis cannot be undone.`)) return;
+  const result = document.getElementById("reconcileResult");
+  result.innerHTML = `<span style="color:var(--muted)">Purging orphans on <code>${escapeHtml(remote)}</code>… can take a moment.</span>`;
+  try {
+    const r = await fetch("/cloud/purge-orphans", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({remote}),
+    });
+    const j = await r.json();
+    if (!j.ok) { alert("Purge failed: " + j.error); return; }
+    alert(`Purged ${j.count_deleted} orphan(s).${j.count_failed ? `\n${j.count_failed} failed.` : ""}`);
+    reconcileWithCloud();  // re-run to show clean state
+  } catch (e) {
+    alert("Purge failed: " + e.message);
   }
 }
 
@@ -5587,6 +5627,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             iid = (payload_in.get("id") or "").strip()
             result = rearchive_entry(iid)
             self._send(200 if result.get("ok") else 400, json.dumps(result).encode(), "application/json")
+
+        elif self.path == "/cloud/purge-orphans":
+            try:
+                payload_in = json.loads(body) if body else {}
+            except Exception:
+                payload_in = {}
+            remote = (payload_in.get("remote") or "").strip()
+            if not remote:
+                self._send(400, b'{"ok":false,"error":"remote required"}', "application/json"); return
+            result = purge_orphans(remote)
+            self._send(200 if result.get("ok") else 500, json.dumps(result).encode(), "application/json")
 
         elif self.path == "/cloud/backfill-sizes":
             result = archives_backfill_sizes()
