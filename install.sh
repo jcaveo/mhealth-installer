@@ -9,8 +9,9 @@
 # Does:
 #   1. Install Homebrew if missing  (you MUST be on macOS)
 #   2. Install Homebrew Python if missing  (avoids the Apple Python TCC bug)
-#   3. Download the latest mhealth-installer.pkg from the GitHub release
-#   4. Open it for you to install (Gatekeeper prompt → right-click Open)
+#   3. Install rclone if missing  (powers Cloud Sync — main feature)
+#   4. Download the latest mhealth-installer.pkg from the GitHub release
+#   5. Open it for you to install (Gatekeeper prompt → right-click Open)
 #
 # If you've already installed the .pkg and just need to fix the Python:
 #     brew install python && mhealth-setup
@@ -58,7 +59,16 @@ else
   ok "Homebrew Python installed ($($BREW_PYTHON --version))"
 fi
 
-# ── Step 3: Download the pkg ───────────────────────────────────────────
+# ── Step 3: rclone (powers Cloud Sync — the main feature) ──────────────
+if command -v rclone >/dev/null 2>&1; then
+  ok "rclone already installed ($(rclone --version | head -1))"
+else
+  note "Installing rclone (bridges to Google Drive, Mega, Dropbox, R2, Box, OneDrive, Storj, pCloud)..."
+  brew install rclone
+  ok "rclone installed ($(rclone --version | head -1))"
+fi
+
+# ── Step 4: Download the pkg ───────────────────────────────────────────
 PKG_URL="${MHEALTH_PKG_URL:-https://github.com/jcaveo/mhealth-installer/raw/main/dist/mhealth-installer.pkg}"
 TMP_PKG="/tmp/mhealth-installer-$(date +%s).pkg"
 
@@ -72,7 +82,7 @@ fi
 SIZE_KB=$(($(wc -c < "$TMP_PKG") / 1024))
 ok "Downloaded ($SIZE_KB KB)"
 
-# ── Step 4: Run the installer ──────────────────────────────────────────
+# ── Step 5: Run the installer ──────────────────────────────────────────
 note "Opening the installer. Click through:"
 echo "    1. 'Open' in the Gatekeeper warning (it's unsigned)"
 echo "    2. Enter your admin password when prompted"
