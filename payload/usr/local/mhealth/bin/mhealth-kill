@@ -1093,6 +1093,74 @@ def rclone_size_bytes(target: str, timeout: int = 60) -> int:
         return -1
 
 
+def rclone_diagnose() -> dict:
+    """Comprehensive diagnostic of what rclone the dashboard is actually using.
+    Surfaces config-path mismatches, missing binaries, and listremotes output
+    so users can compare against what `rclone config` shows in Terminal."""
+    info = {
+        "rclone_path": _which_rclone(),
+        "rclone_version": None,
+        "config_file": None,
+        "config_file_exists": False,
+        "config_file_size": None,
+        "listremotes_raw": None,
+        "listremotes_parsed": [],
+        "listremotes_stderr": None,
+        "env_RCLONE_CONFIG": os.environ.get("RCLONE_CONFIG"),
+        "env_HOME": os.environ.get("HOME"),
+        "expanded_home": os.path.expanduser("~"),
+        "errors": [],
+    }
+    exe = info["rclone_path"]
+    if not exe:
+        info["errors"].append("rclone binary not found at /opt/homebrew/bin/rclone or /usr/local/bin/rclone or in PATH")
+        return info
+
+    # Version
+    try:
+        r = subprocess.run([exe, "version"], capture_output=True, text=True, timeout=5)
+        info["rclone_version"] = (r.stdout.splitlines() or [""])[0]
+    except Exception as e:
+        info["errors"].append(f"rclone version failed: {e}")
+
+    # Config file path (THIS is the key one for diagnosing mismatches)
+    try:
+        r = subprocess.run([exe, "config", "file"], capture_output=True, text=True, timeout=5)
+        cfg_line = r.stdout.strip().splitlines()
+        # rclone outputs: "Configuration file is stored at:\n<path>" OR just the path
+        for line in cfg_line:
+            line = line.strip()
+            if line and line.startswith("/"):
+                info["config_file"] = line
+                break
+    except Exception as e:
+        info["errors"].append(f"rclone config file failed: {e}")
+
+    if info["config_file"]:
+        try:
+            info["config_file_exists"] = os.path.exists(info["config_file"])
+            if info["config_file_exists"]:
+                info["config_file_size"] = os.path.getsize(info["config_file"])
+        except Exception:
+            pass
+
+    # listremotes — the actual answer of "what does the dashboard's rclone see"
+    try:
+        r = subprocess.run([exe, "listremotes", "--long"], capture_output=True, text=True, timeout=10)
+        info["listremotes_raw"] = r.stdout
+        info["listremotes_stderr"] = r.stderr if r.stderr else None
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            name_part, _, type_part = line.partition(":")
+            info["listremotes_parsed"].append({"name": name_part.strip(), "type": type_part.strip()})
+    except Exception as e:
+        info["errors"].append(f"rclone listremotes failed: {e}")
+
+    return info
+
+
 def rclone_setup_mega(name: str, user: str, password: str) -> dict:
     """One-click Mega remote setup. Runs `rclone config create` non-interactively
     and verifies the credentials by listing the remote. On failure, removes
@@ -1347,7 +1415,14 @@ def archive_path_to_cloud(local_path: str, remote: str) -> dict:
         return {"ok": False, "error": "rclone not installed"}
     remotes = {r["name"] for r in rclone_remotes()}
     if remote not in remotes:
-        return {"ok": False, "error": f"remote '{remote}' not configured"}
+        diag = rclone_diagnose()
+        cfg = diag.get("config_file") or "(unknown)"
+        seen = [r["name"] for r in diag.get("listremotes_parsed", [])]
+        return {"ok": False, "error":
+            f"remote '{remote}' not found. The dashboard's rclone is using config file:\n  {cfg}\n"
+            f"It currently sees these remotes: {seen or '(none)'}\n\n"
+            f"If your Terminal's `rclone config` shows the remote but this list is empty, "
+            f"you have a config-path mismatch. Open Cloud Setup → 🔍 Diagnose rclone for details."}
 
     entry_id = f"{int(time.time()*1000)}-{random.randint(0, 9999)}"
     base = os.path.basename(local_path.rstrip("/")) or "root"
@@ -2175,14 +2250,29 @@ HTML = r"""<!DOCTYPE html>
 <title>Mac Health — Kill Processes</title>
 <style>
   :root {
+    color-scheme: light dark;
     --bg: #f5f5f7; --card: #ffffff; --text: #1d1d1f; --muted: #6e6e73;
     --line: #d2d2d7; --accent: #0071e3; --danger: #ff3b30;
     --warn: #ff9500; --ok: #34c759; --row-hover: #f5f5f7;
     --row-sel: #e7f3ff;
+    /* Semantic surfaces — used by panels, banners, modals so dark mode works */
+    --panel-bg: #ffffff; --panel-border: #d2d2d7;
+    --info-bg: #eff6ff; --info-border: #bfdbfe; --info-text: #1e40af;
+    --warn-bg: #fff7ed; --warn-border: #fed7aa; --warn-text: #7c2d12;
+    --success-bg: #f0fdf4; --success-border: #bbf7d0; --success-text: #166534;
+    --danger-bg: #fef2f2; --danger-border: #fecaca; --danger-text: #991b1b;
+    --code-bg: #1f2937; --code-text: #f9fafb;
+    --terminal-bg: #1f2937; --terminal-text: #e5e7eb;
   }
   @media (prefers-color-scheme: dark) {
     :root { --bg: #1d1d1f; --card: #2c2c2e; --text: #f5f5f7; --muted: #a1a1a6;
-            --line: #3a3a3c; --row-hover: #3a3a3c; --row-sel: #003566; }
+            --line: #3a3a3c; --row-hover: #3a3a3c; --row-sel: #003566;
+            --panel-bg: #2c2c2e; --panel-border: #3a3a3c;
+            --info-bg: #1e3a5f; --info-border: #2e4f7c; --info-text: #93c5fd;
+            --warn-bg: #3f2a1b; --warn-border: #6b3f23; --warn-text: #fbbf77;
+            --success-bg: #1a3a26; --success-border: #2d5a3a; --success-text: #86efac;
+            --danger-bg: #3f1b1b; --danger-border: #6b2323; --danger-text: #fca5a5;
+            --code-bg: #0f1419; --code-text: #e5e7eb; }
   }
   * { box-sizing: border-box; }
   body { margin: 0; font: 13px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui;
@@ -2334,8 +2424,8 @@ HTML = r"""<!DOCTYPE html>
   <div style="position:fixed;top:8px;right:14px;z-index:100;display:flex;align-items:center;gap:8px;font-size:12px">
     <span id="snoozeStatus" style="padding:4px 10px;border-radius:14px;background:#d1fae5;color:#065f46;font-weight:500;display:none">🔔 Alerts on</span>
     <div style="position:relative" id="snoozeWrap">
-      <button onclick="toggleSnoozeMenu()" id="snoozeBtn" style="padding:4px 10px;border:1px solid var(--line);border-radius:14px;background:#fff;cursor:pointer;font-size:12px">Snooze ▾</button>
-      <div id="snoozeMenu" style="display:none;position:absolute;top:30px;right:0;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,0.15);min-width:180px;overflow:hidden">
+      <button onclick="toggleSnoozeMenu()" id="snoozeBtn" style="padding:4px 10px;border:1px solid var(--line);border-radius:14px;background:var(--panel-bg);cursor:pointer;font-size:12px">Snooze ▾</button>
+      <div id="snoozeMenu" style="display:none;position:absolute;top:30px;right:0;background:var(--panel-bg);border:1px solid var(--line);border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,0.15);min-width:180px;overflow:hidden">
         <div class="snoozeItem" onclick="setSnooze(900)" style="padding:8px 14px;cursor:pointer;font-size:12px">15 minutes</div>
         <div class="snoozeItem" onclick="setSnooze(3600)" style="padding:8px 14px;cursor:pointer;font-size:12px">1 hour</div>
         <div class="snoozeItem" onclick="setSnooze(7200)" style="padding:8px 14px;cursor:pointer;font-size:12px">2 hours</div>
@@ -2350,7 +2440,7 @@ HTML = r"""<!DOCTYPE html>
 
   <!-- Apple-Python warning banner. Shown only if the running mhealth process is
        Apple's CommandLineTools Python (which silently fails TCC grants). -->
-  <div id="applePythonBanner" style="display:none;background:#fef2f2;border:2px solid #ef4444;border-radius:10px;padding:12px 16px;margin:10px 0;color:#7f1d1d">
+  <div id="applePythonBanner" style="display:none;background:var(--danger-bg);border:2px solid var(--danger-border);border-radius:10px;padding:12px 16px;margin:10px 0;color:var(--danger-text)">
     <div style="font-weight:600;margin-bottom:6px;font-size:14px">⚠️ Folder scanning won't work until you switch Python</div>
     <div style="font-size:13px;line-height:1.5;margin-bottom:10px">
       mhealth is running under <b>Apple's system Python</b>. macOS silently ignores Full Disk Access grants for it — so scans of <code>~/Desktop</code> / <code>~/Downloads</code> will always fail no matter what permissions you set.
@@ -2538,7 +2628,7 @@ HTML = r"""<!DOCTYPE html>
     </h2>
 
     <!-- Compact banner when cloud isn't configured (full setup lives on Cloud Setup tab) -->
-    <div id="cloudSetupHint" style="display:none;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:10px 14px;margin:10px 0;font-size:13px;color:#92400e;display:flex;justify-content:space-between;align-items:center;gap:10px">
+    <div id="cloudSetupHint" style="display:none;background:var(--warn-bg);border:1px solid var(--warn-border);border-radius:8px;padding:10px 14px;margin:10px 0;font-size:13px;color:var(--warn-text);display:flex;justify-content:space-between;align-items:center;gap:10px">
       <span id="cloudSetupHintText">☁️ Cloud archive isn't configured yet. You can still delete regenerable items here, but archiving needs a remote.</span>
       <button onclick="switchTab('cloudsetup')" style="background:#f97316;color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;flex-shrink:0">Set up cloud →</button>
     </div>
@@ -2571,7 +2661,7 @@ HTML = r"""<!DOCTYPE html>
         </div>
         <div id="scanBreadcrumbs" style="display:none;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:8px;font-size:13px;display:flex;align-items:center;gap:6px;flex-wrap:wrap"></div>
         <!-- Active archive jobs panel — survives browser refresh, polls every 2s -->
-        <div id="archiveJobsPanel" style="display:none;background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:8px 12px;margin-bottom:8px;font-size:12px"></div>
+        <div id="archiveJobsPanel" style="display:none;background:var(--info-bg);border:1px solid var(--info-border);border-radius:8px;padding:8px 12px;margin-bottom:8px;font-size:12px"></div>
         <div id="scanTotals" style="display:none;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:8px;font-size:13px"></div>
         <div id="scanActions" style="display:none;margin-bottom:8px">
           <label>Archive to
@@ -2602,7 +2692,7 @@ HTML = r"""<!DOCTYPE html>
           <button onclick="reconcileWithCloud()" title="Find files on cloud that aren't in your local registry (e.g., from interrupted uploads)">🔄 Reconcile with cloud</button>
           <span class="status" id="archStatus"></span>
         </div>
-        <div id="reconcileResult" style="display:none;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:12px"></div>
+        <div id="reconcileResult" style="display:none;background:var(--warn-bg);border:1px solid var(--warn-border);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:12px"></div>
         <table id="archTable">
           <colgroup><col style="width:200px"><col><col style="width:80px"><col style="width:100px"><col style="width:110px"></colgroup>
           <thead><tr><th>Filename</th><th>Original path</th><th>Remote</th><th class="num">Size</th><th></th></tr></thead>
@@ -2639,7 +2729,7 @@ HTML = r"""<!DOCTYPE html>
       </label>
       <span class="status" id="projStatus"></span>
     </div>
-    <div id="discoverPanel" style="display:none;background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:12px 16px;margin-bottom:10px;font-size:12px"></div>
+    <div id="discoverPanel" style="display:none;background:var(--info-bg);border:1px solid var(--info-border);border-radius:8px;padding:12px 16px;margin-bottom:10px;font-size:12px"></div>
     <table id="projTable">
       <colgroup>
         <col style="width:160px">
@@ -2709,7 +2799,7 @@ HTML = r"""<!DOCTYPE html>
     </h2>
 
     <!-- Install rclone (shows only if rclone is missing) -->
-    <div id="cloudSetup" style="display:none;background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:14px 18px;margin:14px 0;color:#7c2d12">
+    <div id="cloudSetup" style="display:none;background:var(--warn-bg);border:1px solid var(--warn-border);border-radius:10px;padding:14px 18px;margin:14px 0;color:var(--warn-text)">
       <div id="cloudSetupBody"></div>
       <div style="margin-top:10px"><button onclick="refreshCloud()">Re-check</button></div>
     </div>
@@ -2719,8 +2809,12 @@ HTML = r"""<!DOCTYPE html>
       <span><b>Configured:</b> <span id="cloudOverviewCounts">0 of 0</span></span>
       <span><b>Total free capacity:</b> <span id="cloudOverviewCapacity">—</span></span>
       <span><b>Total used:</b> <span id="cloudOverviewUsed">—</span></span>
-      <button onclick="refreshCloud()">Re-check all</button>
+      <div>
+        <button onclick="refreshCloud()">Re-check all</button>
+        <button onclick="diagnoseRclone()" title="Show which rclone binary + config file the dashboard is using. Helps diagnose 'I configured a remote in Terminal but the dashboard doesn't see it' issues.">🔍 Diagnose rclone</button>
+      </div>
     </div>
+    <div id="rcloneDiagnoseOutput" style="display:none;background:var(--terminal-bg);color:var(--terminal-text);border-radius:8px;padding:12px 16px;margin:10px 0;font-family:ui-monospace,Menlo,monospace;font-size:11px;white-space:pre-wrap;overflow:auto;max-height:400px"></div>
 
     <!-- Always-visible providers grid -->
     <div id="providersGrid" style="display:none;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin:14px 0"></div>
@@ -2729,7 +2823,7 @@ HTML = r"""<!DOCTYPE html>
     <div id="providerRecipe" style="display:none"></div>
 
     <!-- Helpful hint shown once at least one provider is configured -->
-    <div id="cloudSetupReady" style="display:none;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:12px 16px;margin:14px 0;color:#166534;font-size:13px;line-height:1.6">
+    <div id="cloudSetupReady" style="display:none;background:var(--success-bg);border:1px solid var(--success-border);border-radius:8px;padding:12px 16px;margin:14px 0;color:var(--success-text);font-size:13px;line-height:1.6">
       <b>✓ Cloud is ready.</b> Head to the <b>Cloud Sync</b> tab → scan any folder → use <b>☁️ Archive selected</b> to send cold assets. Restore from the Archived items panel anytime.
     </div>
   </div>
@@ -3373,7 +3467,7 @@ async function checkPythonHealth() {
       fixEl.innerHTML = `
         <div style="font-size:12px;margin-bottom:8px"><b>Fix:</b> open Terminal and run this one line — installs brew Python (if you don't have it), reconfigures mhealth, restarts.</div>
         ${codeBlockWithCopy("brew install python && mhealth-setup && launchctl kickstart -k \"gui/$(id -u)/com.mhealth.server\"")}
-        <div style="font-size:11px;margin-top:6px;color:#92400e">No Homebrew yet? Install from <a href="https://brew.sh" target="_blank" rel="noopener" style="color:#7f1d1d">brew.sh</a> first.</div>`;
+        <div style="font-size:11px;margin-top:6px;color:var(--warn-text)">No Homebrew yet? Install from <a href="https://brew.sh" target="_blank" rel="noopener" style="color:var(--danger-text)">brew.sh</a> first.</div>`;
     }
     banner.style.display = "block";
   } catch (e) {
@@ -3407,7 +3501,7 @@ let navigationStack = [];
 function codeBlockWithCopy(code, label) {
   const id = "code-" + Math.random().toString(36).slice(2, 10);
   const safe = escapeHtml(code);
-  return `<div style="position:relative;background:#1f2937;color:#f9fafb;border-radius:6px;padding:10px 70px 10px 14px;margin:6px 0;font-family:ui-monospace,Menlo,monospace;font-size:12px;overflow:auto;white-space:pre"><span id="${id}">${safe}</span><button onclick="copyCodeBlock('${id}', this)" style="position:absolute;top:6px;right:6px;background:#374151;color:#f9fafb;border:1px solid #4b5563;border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer">Copy</button></div>`;
+  return `<div style="position:relative;background:var(--terminal-bg);color:var(--terminal-text);border-radius:6px;padding:10px 70px 10px 14px;margin:6px 0;font-family:ui-monospace,Menlo,monospace;font-size:12px;overflow:auto;white-space:pre"><span id="${id}">${safe}</span><button onclick="copyCodeBlock('${id}', this)" style="position:absolute;top:6px;right:6px;background:#374151;color:var(--terminal-text);border:1px solid #4b5563;border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer">Copy</button></div>`;
 }
 
 async function copyCodeBlock(id, btn) {
@@ -3426,7 +3520,7 @@ async function copyCodeBlock(id, btn) {
 
 // Helper: a provider chooser card.
 function providerCard(id, name, tagline, freeTier, blurb) {
-  return `<div onclick="showRecipe('${id}')" style="background:#fff;border:1px solid #fed7aa;border-radius:8px;padding:12px;cursor:pointer;transition:all 0.15s" onmouseover="this.style.borderColor='#f97316';this.style.boxShadow='0 2px 8px rgba(249,115,22,0.15)'" onmouseout="this.style.borderColor='#fed7aa';this.style.boxShadow='none'">
+  return `<div onclick="showRecipe('${id}')" style="background:var(--panel-bg);border:1px solid var(--warn-border);border-radius:8px;padding:12px;cursor:pointer;transition:all 0.15s" onmouseover="this.style.borderColor='#f97316';this.style.boxShadow='0 2px 8px rgba(249,115,22,0.15)'" onmouseout="this.style.borderColor='#fed7aa';this.style.boxShadow='none'">
     <div style="font-weight:600;font-size:14px;color:#111827;margin-bottom:2px">${escapeHtml(name)}</div>
     <div style="font-size:11px;color:#f97316;margin-bottom:6px">${escapeHtml(tagline)} · ${escapeHtml(freeTier)}</div>
     <div style="font-size:11px;color:#6b7280;line-height:1.4">${escapeHtml(blurb)}</div>
@@ -3443,7 +3537,7 @@ function showRecipe(provider) {
 
 // Step block builder.
 function step(n, title, body) {
-  return `<div style="display:flex;gap:12px;margin:10px 0;padding:10px 12px;background:#fff;border:1px solid #fed7aa;border-radius:6px">
+  return `<div style="display:flex;gap:12px;margin:10px 0;padding:10px 12px;background:var(--panel-bg);border:1px solid var(--warn-border);border-radius:6px">
     <div style="flex:0 0 28px;height:28px;background:#f97316;color:#fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:13px">${n}</div>
     <div style="flex:1;color:#111827;font-size:13px;line-height:1.55"><div style="font-weight:600;margin-bottom:4px">${title}</div>${body}</div>
   </div>`;
@@ -3451,7 +3545,7 @@ function step(n, title, body) {
 
 // Provider recipes — same structure for all three.
 const RECIPES = {
-  r2: `<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:14px;margin-top:10px">
+  r2: `<div style="background:var(--warn-bg);border:1px solid var(--warn-border);border-radius:8px;padding:14px;margin-top:10px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
       <h4 style="margin:0;color:#111827;font-size:14px">Cloudflare R2 setup</h4>
       <button onclick="document.getElementById('providerRecipe').style.display='none'" style="background:transparent;border:none;color:#6b7280;cursor:pointer;font-size:18px;padding:0 4px">×</button>
@@ -3479,7 +3573,7 @@ n/s/q> q`))}
     <div style="text-align:right;margin-top:8px"><button onclick="refreshCloud()" style="background:#f97316;color:#fff;border:none;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer">Re-check</button></div>
   </div>`,
 
-  gdrive: `<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:14px;margin-top:10px">
+  gdrive: `<div style="background:var(--warn-bg);border:1px solid var(--warn-border);border-radius:8px;padding:14px;margin-top:10px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
       <h4 style="margin:0;color:#111827;font-size:14px">Google Drive setup</h4>
       <button onclick="document.getElementById('providerRecipe').style.display='none'" style="background:transparent;border:none;color:#6b7280;cursor:pointer;font-size:18px;padding:0 4px">×</button>
@@ -3504,7 +3598,7 @@ n/s/q> q`))}
     <div style="text-align:right;margin-top:8px"><button onclick="refreshCloud()" style="background:#f97316;color:#fff;border:none;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer">Re-check</button></div>
   </div>`,
 
-  mega: `<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:14px;margin-top:10px">
+  mega: `<div style="background:var(--warn-bg);border:1px solid var(--warn-border);border-radius:8px;padding:14px;margin-top:10px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
       <h4 style="margin:0;color:#111827;font-size:14px">Mega setup</h4>
       <button onclick="document.getElementById('providerRecipe').style.display='none'" style="background:transparent;border:none;color:#6b7280;cursor:pointer;font-size:18px;padding:0 4px">×</button>
@@ -3529,7 +3623,7 @@ n/s/q> q`))}
   dropbox: oauthRecipe("Dropbox", "dropbox", 15, "https://dropbox.com"),
   onedrive: oauthRecipe("OneDrive", "onedrive", 42, "https://onedrive.live.com"),
   pcloud: oauthRecipe("pCloud", "pcloud", 46, "https://pcloud.com"),
-  storj: `<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:14px;margin-top:10px">
+  storj: `<div style="background:var(--warn-bg);border:1px solid var(--warn-border);border-radius:8px;padding:14px;margin-top:10px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
       <h4 style="margin:0;color:#111827;font-size:14px">Storj setup</h4>
       <button onclick="document.getElementById('providerRecipe').style.display='none'" style="background:transparent;border:none;color:#6b7280;cursor:pointer;font-size:18px;padding:0 4px">×</button>
@@ -3553,7 +3647,7 @@ n/s/q> q`))}
 // Generic OAuth-based recipe (works for Box/Dropbox/OneDrive/pCloud — they all
 // share the "auto config opens browser → click allow → done" pattern)
 function oauthRecipe(displayName, rcloneType, storageNumber, signupUrl) {
-  return `<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:14px;margin-top:10px">
+  return `<div style="background:var(--warn-bg);border:1px solid var(--warn-border);border-radius:8px;padding:14px;margin-top:10px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
       <h4 style="margin:0;color:#111827;font-size:14px">${displayName} setup</h4>
       <button onclick="document.getElementById('providerRecipe').style.display='none'" style="background:transparent;border:none;color:#6b7280;cursor:pointer;font-size:18px;padding:0 4px">×</button>
@@ -3652,6 +3746,69 @@ const PROVIDER_CATALOG = [
     match: r => r.type === "storj" },
 ];
 
+// ---- rclone diagnose: surface config-path mismatches ----
+async function diagnoseRclone() {
+  const out = document.getElementById("rcloneDiagnoseOutput");
+  if (!out) return;
+  out.style.display = "block";
+  out.textContent = "Running diagnostic…";
+  try {
+    const r = await fetch("/system/rclone-diagnose");
+    const d = await r.json();
+    const lines = [];
+    lines.push("════════════════════════════════════════════════════════════");
+    lines.push("  rclone diagnostic — what the dashboard's rclone sees");
+    lines.push("════════════════════════════════════════════════════════════");
+    lines.push("");
+    lines.push(`Binary path:     ${d.rclone_path || "(NOT FOUND)"}`);
+    lines.push(`Version:         ${d.rclone_version || "?"}`);
+    lines.push("");
+    lines.push(`Config file:     ${d.config_file || "(none reported)"}`);
+    lines.push(`  exists?        ${d.config_file_exists ? "✓ yes" : "✗ NO"}`);
+    lines.push(`  size:          ${d.config_file_size != null ? d.config_file_size + " bytes" : "—"}`);
+    lines.push("");
+    lines.push(`RCLONE_CONFIG env: ${d.env_RCLONE_CONFIG || "(unset)"}`);
+    lines.push(`HOME env:          ${d.env_HOME || "(unset)"}`);
+    lines.push(`Expanded ~:        ${d.expanded_home || "?"}`);
+    lines.push("");
+    lines.push(`Remotes seen (${d.listremotes_parsed.length}):`);
+    if (d.listremotes_parsed.length === 0) {
+      lines.push("  (none)");
+    } else {
+      d.listremotes_parsed.forEach(r => lines.push(`  • ${r.name}  [${r.type}]`));
+    }
+    if (d.listremotes_stderr) {
+      lines.push("");
+      lines.push("stderr from listremotes:");
+      lines.push("  " + d.listremotes_stderr.split("\n").join("\n  "));
+    }
+    if (d.errors && d.errors.length) {
+      lines.push("");
+      lines.push("Errors:");
+      d.errors.forEach(e => lines.push("  ✗ " + e));
+    }
+    lines.push("");
+    lines.push("════════════════════════════════════════════════════════════");
+    lines.push("  Compare with Terminal:");
+    lines.push("════════════════════════════════════════════════════════════");
+    lines.push("  rclone config file       # should match 'Config file' above");
+    lines.push("  rclone listremotes --long # should match 'Remotes seen' above");
+    lines.push("");
+    lines.push("If they DIFFER, you have a config-path mismatch. Common causes:");
+    lines.push("  1. Your shell's .zshrc / .bashrc sets RCLONE_CONFIG to a custom path");
+    lines.push("     (dashboard's launchd-spawned rclone doesn't inherit shell env)");
+    lines.push("  2. Multiple rclone binaries installed (brew + MacPorts + manual)");
+    lines.push("  3. Different effective HOME in launchd vs Terminal (rare)");
+    lines.push("");
+    lines.push("To FIX a config-path mismatch:");
+    lines.push("  Copy your terminal config to the path shown above, e.g.:");
+    lines.push(`  cp <terminal-config-path> ${d.config_file || "<dashboard-config-path>"}`);
+    out.textContent = lines.join("\n");
+  } catch (e) {
+    out.textContent = "Diagnose failed: " + e.message;
+  }
+}
+
 // ---- One-click Mega setup modal ----
 function openMegaQuickSetup() {
   // Close any existing modal
@@ -3660,13 +3817,13 @@ function openMegaQuickSetup() {
   m.className = "mega-quick-modal";
   m.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:10000;display:flex;align-items:center;justify-content:center";
   m.innerHTML = `
-    <div style="background:#fff;border-radius:10px;padding:20px 24px;max-width:440px;width:92%;box-shadow:0 12px 48px rgba(0,0,0,0.3)">
+    <div style="background:var(--panel-bg);border-radius:10px;padding:20px 24px;max-width:440px;width:92%;box-shadow:0 12px 48px rgba(0,0,0,0.3)">
       <h3 style="margin:0 0 4px;font-size:16px">⚡ Quick Mega setup</h3>
       <div style="font-size:12px;color:var(--muted);margin-bottom:14px">
         No Terminal needed. Your password is sent over 127.0.0.1 only (never leaves your Mac),
         then stored encrypted by rclone at <code style="font-size:11px">~/.config/rclone/rclone.conf</code>.
       </div>
-      <div id="megaQuickError" style="display:none;background:#fef2f2;border:1px solid #fecaca;color:#991b1b;border-radius:6px;padding:8px 12px;margin-bottom:10px;font-size:12px"></div>
+      <div id="megaQuickError" style="display:none;background:var(--danger-bg);border:1px solid var(--danger-border);color:var(--danger-text);border-radius:6px;padding:8px 12px;margin-bottom:10px;font-size:12px"></div>
       <form id="megaQuickForm" onsubmit="submitMegaQuickSetup(event)">
         <div style="display:grid;grid-template-columns:90px 1fr;gap:8px 12px;align-items:center;font-size:13px">
           <label>Remote name</label>
@@ -3738,7 +3895,7 @@ function renderProvidersGrid() {
     const headerBg = configured ? "#d1fae5" : "#f9fafb";
     const statusBadge = configured
       ? '<span style="background:#16a34a;color:#fff;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600">✓ CONFIGURED</span>'
-      : '<span style="background:#fed7aa;color:#7c2d12;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600">TO DO</span>';
+      : '<span style="background:#fed7aa;color:var(--warn-text);padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600">TO DO</span>';
     let bodyHtml;
     if (configured) {
       const has = matched.total != null;
@@ -3747,7 +3904,7 @@ function renderProvidersGrid() {
         ? `<div style="height:6px;background:#e5e7eb;border-radius:3px;margin:6px 0;overflow:hidden"><div style="height:100%;width:${pct||0}%;background:#16a34a"></div></div>`
         : "";
       const usage = has
-        ? `<div style="font-size:11px;color:#15803d">${fmtBytes(matched.used)} used · ${fmtBytes(matched.free)} free of ${fmtBytes(matched.total)}</div>`
+        ? `<div style="font-size:11px;color:var(--success-text)">${fmtBytes(matched.used)} used · ${fmtBytes(matched.free)} free of ${fmtBytes(matched.total)}</div>`
         : '<div style="font-size:11px;color:#6b7280">Usage info unavailable for this backend</div>';
       bodyHtml = `
         <div style="font-size:11px;color:#6b7280">Remote name: <code>${escapeHtml(matched.name)}</code></div>
@@ -3761,7 +3918,7 @@ function renderProvidersGrid() {
       bodyHtml = `
         <div style="font-size:11px;color:#6b7280;margin:4px 0 8px;min-height:30px">${escapeHtml(p.blurb)}</div>
         ${quickBtn}
-        <button onclick="showRecipe('${p.id}')" style="width:100%;padding:6px;border:1px solid var(--accent);background:#fff;color:var(--accent);border-radius:6px;cursor:pointer;font-weight:500">Set up via Terminal →</button>`;
+        <button onclick="showRecipe('${p.id}')" style="width:100%;padding:6px;border:1px solid var(--accent);background:var(--panel-bg);color:var(--accent);border-radius:6px;cursor:pointer;font-weight:500">Set up via Terminal →</button>`;
     }
     return `<div style="border:2px solid ${cardBorder};border-radius:10px;overflow:hidden">
       <div style="padding:8px 12px;background:${headerBg};display:flex;justify-content:space-between;align-items:center">
@@ -3808,13 +3965,13 @@ function renderCloudHeader() {
   if (!cloudState.rclone_available) {
     setupEl.style.display = "block";
     setupBody.innerHTML = `
-      <h3 style="margin:0 0 12px;font-size:15px;color:#7c2d12">Step 1 — Install rclone</h3>
+      <h3 style="margin:0 0 12px;font-size:15px;color:var(--warn-text)">Step 1 — Install rclone</h3>
       <div style="margin-bottom:8px">Open Terminal and run:</div>
       ${codeBlockWithCopy("brew install rclone")}
-      <div style="font-size:12px;margin-top:10px;color:#92400e">
-        Don't have Homebrew? Install it first from <a href="https://brew.sh" target="_blank" rel="noopener" style="color:#92400e;font-weight:600">brew.sh</a>.
+      <div style="font-size:12px;margin-top:10px;color:var(--warn-text)">
+        Don't have Homebrew? Install it first from <a href="https://brew.sh" target="_blank" rel="noopener" style="color:var(--warn-text);font-weight:600">brew.sh</a>.
       </div>
-      <div style="margin-top:14px;font-size:12px;color:#7c2d12">
+      <div style="margin-top:14px;font-size:12px;color:var(--warn-text)">
         rclone bridges to 30+ cloud providers. Free, open-source, no account needed for the tool itself. Once installed, all providers below become configurable.
       </div>`;
     if (document.getElementById("providersGrid")) document.getElementById("providersGrid").style.display = "none";
@@ -3868,7 +4025,7 @@ function renderArchives() {
   rows.innerHTML = archives.length === 0
     ? (noRemotes
         ? `<tr><td colspan="5" style="padding:24px;text-align:center">
-            <div style="font-size:14px;color:#7c2d12;margin-bottom:8px">☁️ Set up a cloud provider first</div>
+            <div style="font-size:14px;color:var(--warn-text);margin-bottom:8px">☁️ Set up a cloud provider first</div>
             <div style="font-size:12px;color:var(--muted);margin-bottom:14px;max-width:480px;margin-left:auto;margin-right:auto">
               Cloud Sync needs at least one configured cloud remote (Mega / Google Drive / Cloudflare R2 / Dropbox / OneDrive / Box / pCloud / Storj). Setup is one-time per dev, takes ~3 min.
             </div>
@@ -3968,13 +4125,13 @@ async function reconcileWithCloud() {
     const r = await fetch("/cloud/reconcile?remote=" + encodeURIComponent(remote));
     const j = await r.json();
     if (!j.ok) {
-      result.innerHTML = `<span style="color:#dc2626">Reconcile failed: ${escapeHtml(j.error)}</span>`;
+      result.innerHTML = `<span style="color:var(--danger-text)">Reconcile failed: ${escapeHtml(j.error)}</span>`;
       return;
     }
     const orphans = j.orphans || [];
     const missing = j.missing_local || [];
-    let html = `<div style="font-weight:600;color:#7c2d12;margin-bottom:6px">Reconcile: <code>${escapeHtml(remote)}</code></div>`;
-    html += `<div style="color:#92400e">✓ ${j.registered.length} item(s) match registry · ☁️ ${orphans.length} orphan(s) on cloud · 📭 ${missing.length} missing on cloud</div>`;
+    let html = `<div style="font-weight:600;color:var(--warn-text);margin-bottom:6px">Reconcile: <code>${escapeHtml(remote)}</code></div>`;
+    html += `<div style="color:var(--warn-text)">✓ ${j.registered.length} item(s) match registry · ☁️ ${orphans.length} orphan(s) on cloud · 📭 ${missing.length} missing on cloud</div>`;
 
     if (orphans.length > 0) {
       html += `<div style="margin-top:10px;display:flex;justify-content:space-between;align-items:center">
@@ -3994,7 +4151,7 @@ async function reconcileWithCloud() {
         </tr>`;
       }
       html += `</tbody></table>`;
-      html += `<div style="margin-top:6px;font-size:11px;color:#92400e">Import: register an orphan as a real archive (so it shows in Archived items). Purge: bulk-delete all orphans from cloud (useful when they're partial uploads).</div>`;
+      html += `<div style="margin-top:6px;font-size:11px;color:var(--warn-text)">Import: register an orphan as a real archive (so it shows in Archived items). Purge: bulk-delete all orphans from cloud (useful when they're partial uploads).</div>`;
     }
 
     if (missing.length > 0) {
@@ -4004,7 +4161,7 @@ async function reconcileWithCloud() {
         html += `<li>${escapeHtml(m.name || m.original_path || "")} — <code>${escapeHtml(m.remote_path)}</code></li>`;
       }
       html += `</ul>`;
-      html += `<div style="margin-top:6px;font-size:11px;color:#92400e">These may have been deleted from cloud out-of-band. Their registry entries are stale.</div>`;
+      html += `<div style="margin-top:6px;font-size:11px;color:var(--warn-text)">These may have been deleted from cloud out-of-band. Their registry entries are stale.</div>`;
     }
 
     if (orphans.length === 0 && missing.length === 0) {
@@ -4012,7 +4169,7 @@ async function reconcileWithCloud() {
     }
     result.innerHTML = html;
   } catch (e) {
-    result.innerHTML = `<span style="color:#dc2626">Reconcile failed: ${escapeHtml(e.message)}</span>`;
+    result.innerHTML = `<span style="color:var(--danger-text)">Reconcile failed: ${escapeHtml(e.message)}</span>`;
   }
 }
 
@@ -4225,7 +4382,7 @@ async function showTccHelp(path, rawError) {
   if (!el) {
     el = document.createElement("div");
     el.id = "tccHelp";
-    el.style.cssText = "background:#fff7ed;border:2px solid #fb923c;border-radius:10px;padding:16px 20px;margin:14px 0;color:#7c2d12";
+    el.style.cssText = "background:var(--warn-bg);border:2px solid var(--warn-border);border-radius:10px;padding:16px 20px;margin:14px 0;color:var(--warn-text)";
     // Insert above the scan table area, after the Browse toolbar
     const anchor = document.getElementById("scanTable");
     anchor.parentNode.insertBefore(el, anchor);
@@ -4249,22 +4406,22 @@ async function showTccHelp(path, rawError) {
   const grantTargetName = grantTarget.split("/").pop();
   const grantWhat = isAppBundle ? "the Python.app bundle" : "python3";
   el.innerHTML = `
-    <h3 style="margin:0 0 10px;font-size:15px;color:#7c2d12">🔒 macOS is blocking access to <code>${escapeHtml(path)}</code></h3>
+    <h3 style="margin:0 0 10px;font-size:15px;color:var(--warn-text)">🔒 macOS is blocking access to <code>${escapeHtml(path)}</code></h3>
     <p style="margin:0 0 8px;font-size:13px">macOS protects <b>Documents</b>, <b>Desktop</b>, and <b>Downloads</b> behind Full Disk Access. The running mhealth process is:</p>
-    <div style="background:#fff;border:1px solid #fed7aa;border-radius:6px;padding:8px 12px;margin-bottom:14px;font-size:11px;font-family:ui-monospace,Menlo,monospace;word-break:break-all">
+    <div style="background:var(--panel-bg);border:1px solid var(--warn-border);border-radius:6px;padding:8px 12px;margin-bottom:14px;font-size:11px;font-family:ui-monospace,Menlo,monospace;word-break:break-all">
       ${escapeHtml(info.running_binary || info.sys_executable_real)}
       ${isAppBundle ? `<div style="margin-top:6px;color:#16a34a;font-family:inherit;font-size:12px"><b>⚠️ This binary lives inside a <code>.app</code> bundle.</b> macOS TCC validates against the <code>.app</code>, not the inner binary. <b>You must drag the .app, not python3.</b></div>` : ""}
     </div>
 
-    <div style="background:#fff;border:1px solid #fb923c;border-radius:8px;padding:12px;margin-bottom:14px">
-      <div style="font-weight:600;margin-bottom:8px;color:#7c2d12">⭐ Steps:</div>
+    <div style="background:var(--panel-bg);border:1px solid #fb923c;border-radius:8px;padding:12px;margin-bottom:14px">
+      <div style="font-weight:600;margin-bottom:8px;color:var(--warn-text)">⭐ Steps:</div>
       <ol style="margin:0 0 6px 22px;padding:0;font-size:13px;line-height:1.7">
         <li>
-          <button onclick="revealPython()" style="padding:4px 12px;border-radius:4px;border:1px solid #fb923c;background:#fff;cursor:pointer;font-weight:500">📂 Show ${escapeHtml(grantTargetName)} in Finder</button>
+          <button onclick="revealPython()" style="padding:4px 12px;border-radius:4px;border:1px solid #fb923c;background:var(--panel-bg);cursor:pointer;font-weight:500">📂 Show ${escapeHtml(grantTargetName)} in Finder</button>
           — opens Finder with ${escapeHtml(grantWhat)} highlighted
         </li>
         <li>
-          <button onclick="openPrivacySettings()" style="padding:4px 12px;border-radius:4px;border:1px solid #fb923c;background:#fff;cursor:pointer;font-weight:500">⚙️ Open Privacy Settings</button>
+          <button onclick="openPrivacySettings()" style="padding:4px 12px;border-radius:4px;border:1px solid #fb923c;background:var(--panel-bg);cursor:pointer;font-weight:500">⚙️ Open Privacy Settings</button>
           — opens System Settings → Privacy &amp; Security
         </li>
         <li>Scroll to <b>Full Disk Access</b> in Settings</li>
@@ -4272,26 +4429,26 @@ async function showTccHelp(path, rawError) {
         <li><b>Drag</b> the highlighted <code>${escapeHtml(grantTargetName)}</code> from Finder <b>into</b> the Full Disk Access list</li>
         <li>Make sure the toggle next to it is <b>ON</b></li>
         <li><button onclick="restartServerAndRescan('${escapeHtml(path)}')" style="padding:4px 12px;border-radius:4px;border:1px solid #fb923c;background:#fb923c;color:#fff;cursor:pointer;font-weight:500">Restart server &amp; rescan</button></li>
-        <li style="color:#7c2d12;font-size:12px">Still not working? <button onclick="runTccDiagnose()" style="padding:2px 8px;border-radius:4px;border:1px solid #fb923c;background:#fff;cursor:pointer">🔍 Diagnose</button></li>
+        <li style="color:var(--warn-text);font-size:12px">Still not working? <button onclick="runTccDiagnose()" style="padding:2px 8px;border-radius:4px;border:1px solid #fb923c;background:var(--panel-bg);cursor:pointer">🔍 Diagnose</button></li>
       </ol>
     </div>
 
-    <div id="tccDiagnoseOutput" style="display:none;background:#1f2937;color:#e5e7eb;border-radius:8px;padding:12px 16px;margin-bottom:14px;font-family:ui-monospace,Menlo,monospace;font-size:11px;white-space:pre-wrap;overflow:auto;max-height:300px"></div>
+    <div id="tccDiagnoseOutput" style="display:none;background:var(--terminal-bg);color:#e5e7eb;border-radius:8px;padding:12px 16px;margin-bottom:14px;font-family:ui-monospace,Menlo,monospace;font-size:11px;white-space:pre-wrap;overflow:auto;max-height:300px"></div>
 
-    <details style="font-size:12px;color:#92400e;margin-top:6px">
+    <details style="font-size:12px;color:var(--warn-text);margin-top:6px">
       <summary style="cursor:pointer">Manual path (advanced)</summary>
       <div style="margin-top:8px">
         In Privacy &amp; Security → Full Disk Access → click <b>+</b> → Cmd+Shift+G → paste path → Enter.
       </div>
       <div style="margin-top:6px">
-        <div style="font-size:11px;color:#7c2d12;margin-bottom:2px"><b>Best target</b> (what macOS validates against):</div>
+        <div style="font-size:11px;color:var(--warn-text);margin-bottom:2px"><b>Best target</b> (what macOS validates against):</div>
         <div style="display:flex;gap:6px;align-items:center">
-          <code style="flex:1;padding:6px 10px;background:#fff;border:1px solid #fed7aa;border-radius:4px;font-size:12px;user-select:all">${escapeHtml(grantTarget)}</code>
-          <button onclick="copyTextToClipboard('${escapeHtml(grantTarget)}', this)" style="padding:4px 10px;border-radius:4px;border:1px solid #fb923c;background:#fff;cursor:pointer">Copy</button>
+          <code style="flex:1;padding:6px 10px;background:var(--panel-bg);border:1px solid var(--warn-border);border-radius:4px;font-size:12px;user-select:all">${escapeHtml(grantTarget)}</code>
+          <button onclick="copyTextToClipboard('${escapeHtml(grantTarget)}', this)" style="padding:4px 10px;border-radius:4px;border:1px solid #fb923c;background:var(--panel-bg);cursor:pointer">Copy</button>
         </div>
       </div>
-      <div style="margin-top:6px;font-size:11px;color:#92400e">Other paths involved:</div>
-      <div style="margin-top:2px;font-size:11px;font-family:ui-monospace,Menlo,monospace;color:#92400e">
+      <div style="margin-top:6px;font-size:11px;color:var(--warn-text)">Other paths involved:</div>
+      <div style="margin-top:2px;font-size:11px;font-family:ui-monospace,Menlo,monospace;color:var(--warn-text)">
         sys.executable:&nbsp;${escapeHtml(info.sys_executable)}<br>
         realpath:&nbsp;${escapeHtml(info.sys_executable_real)}<br>
         ${info.running_binary ? `running:&nbsp;${escapeHtml(info.running_binary)}<br>` : ""}
@@ -4299,7 +4456,7 @@ async function showTccHelp(path, rawError) {
       </div>
     </details>
 
-    <details style="font-size:12px;color:#92400e;margin-top:8px">
+    <details style="font-size:12px;color:var(--warn-text);margin-top:8px">
       <summary style="cursor:pointer">Why? + raw error</summary>
       <p style="margin:6px 0">macOS's TCC (Transparency, Consent &amp; Control) blocks background services from reading Documents/Desktop/Downloads without explicit user consent. TCC validates against the <i>actually-running</i> binary or its enclosing <code>.app</code> bundle — not necessarily what <code>which python3</code> or symlinks point at.</p>
       <p style="margin:6px 0"><b>Raw error:</b> ${escapeHtml(rawError || "")}</p>
@@ -4384,7 +4541,7 @@ async function restartServerAndRescan(path) {
     overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:10000;display:flex;align-items:center;justify-content:center;color:#fff;font-size:15px";
     document.body.appendChild(overlay);
   }
-  overlay.innerHTML = `<div style="background:#1f2937;border-radius:10px;padding:24px 32px;text-align:center;min-width:280px">
+  overlay.innerHTML = `<div style="background:var(--terminal-bg);border-radius:10px;padding:24px 32px;text-align:center;min-width:280px">
     <div style="font-size:28px;margin-bottom:10px">⏳</div>
     <div id="restartMsg" style="font-weight:600;margin-bottom:6px">Restarting server…</div>
     <div style="font-size:12px;opacity:0.7" id="restartSub">Triggering shutdown. launchd will bring it back in a moment.</div>
@@ -4645,7 +4802,7 @@ function renderJobs(jobs) {
     const summary = [];
     if (active.length) summary.push(`<b style="color:#0369a1">${active.length} uploading</b>`);
     if (done.length)   summary.push(`<span style="color:#374151">${done.length} done</span>`);
-    if (failed.length) summary.push(`<span style="color:#dc2626">${failed.length} failed</span>`);
+    if (failed.length) summary.push(`<span style="color:var(--danger-text)">${failed.length} failed</span>`);
     el.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center">
       <div>📋 Archive jobs: ${summary.join(" · ") || "none"}${active.length ? ` <span style="color:#6b7280;margin-left:8px">(${escapeHtml(active[0].name || "")} · ${fmtDur(now - (active[0].started_at || now))})</span>` : ""}</div>
       <button class="tiny" onclick="setJobsPanelMinimized(false)" title="Expand jobs panel">▼ Expand</button>
@@ -4685,7 +4842,7 @@ function renderJobs(jobs) {
       timeHtml = `<span style="color:#6b7280" title="${escapeHtml(fmtAbsDateTime(startedAt))}">${fmtAgo(now - startedAt)} (${escapeHtml(fmtAbsDateTime(startedAt))})</span>`;
     }
 
-    const errPart = j.error ? `<div style="color:#dc2626;margin-top:2px;font-size:11px">→ ${escapeHtml(j.error.slice(0, 200))}</div>` : "";
+    const errPart = j.error ? `<div style="color:var(--danger-text);margin-top:2px;font-size:11px">→ ${escapeHtml(j.error.slice(0, 200))}</div>` : "";
     // ✕ dismiss button only on terminal-state jobs (don't let user dismiss a running upload)
     const isTerminal = j.status === "done" || j.status === "failed" || j.status === "interrupted";
     const dismissBtn = isTerminal
@@ -4709,7 +4866,7 @@ function renderJobs(jobs) {
 
   const terminalCount = done.length + failed.length;
   el.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
-    <div style="font-weight:600;color:#1e40af">Active archive jobs ${active.length ? `(${active.length} running)` : "(all complete)"}</div>
+    <div style="font-weight:600;color:var(--info-text)">Active archive jobs ${active.length ? `(${active.length} running)` : "(all complete)"}</div>
     <div style="display:flex;gap:6px">
       ${terminalCount > 0 ? `<button class="tiny" onclick="clearAllDoneJobs()" title="Remove all completed/failed/interrupted entries from this list">Clear ${terminalCount} log${terminalCount===1?'':'s'}</button>` : ""}
       <button class="tiny" onclick="setJobsPanelMinimized(true)" title="Minimize panel — keep a one-line status bar">▲ Minimize</button>
@@ -4772,10 +4929,10 @@ function showActionsMenu(items, anchor) {
   document.querySelectorAll(".actions-menu").forEach(m => m.remove());
   const menu = document.createElement("div");
   menu.className = "actions-menu";
-  menu.style.cssText = "position:absolute;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,0.18);min-width:340px;max-width:400px;z-index:9999;overflow:hidden";
+  menu.style.cssText = "position:absolute;background:var(--panel-bg);border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,0.18);min-width:340px;max-width:400px;z-index:9999;overflow:hidden";
   items.forEach((it, i) => {
     const row = document.createElement("div");
-    const danger = it.danger ? "background:#fef2f2;" : "";
+    const danger = it.danger ? "background:var(--danger-bg);" : "";
     const titleColor = it.danger ? "#991b1b" : "#111827";
     row.style.cssText = `padding:10px 14px;cursor:pointer;border-top:${i?'1px solid var(--line)':'none'};${danger}`;
     row.innerHTML = `
@@ -4970,7 +5127,7 @@ async function openInCloud(remote, remotePath) {
     // the user knows where to navigate.
     if (remotePath) {
       const toast = document.createElement("div");
-      toast.style.cssText = "position:fixed;bottom:20px;right:20px;background:#1f2937;color:#fff;padding:12px 16px;border-radius:8px;z-index:9999;max-width:420px;font-size:12px;box-shadow:0 4px 16px rgba(0,0,0,0.3);line-height:1.5";
+      toast.style.cssText = "position:fixed;bottom:20px;right:20px;background:var(--terminal-bg);color:#fff;padding:12px 16px;border-radius:8px;z-index:9999;max-width:420px;font-size:12px;box-shadow:0 4px 16px rgba(0,0,0,0.3);line-height:1.5";
       toast.innerHTML = `Opened <b>${escapeHtml(remote)}</b> web UI.<br>Navigate to:<br><code style="color:#86efac;font-size:11px;word-break:break-all">${escapeHtml(remotePath)}</code>`;
       document.body.appendChild(toast);
       setTimeout(() => toast.remove(), 10000);
@@ -5000,9 +5157,9 @@ async function refreshProjects() {
 }
 
 function stateLabel(s) {
-  if (s === "in_progress") return '<span class="badge" style="background:#fef3c7;color:#92400e">In progress</span>';
+  if (s === "in_progress") return '<span class="badge" style="background:#fef3c7;color:var(--warn-text)">In progress</span>';
   if (s === "finished") return '<span class="badge" style="background:#d1fae5;color:#065f46">Finished</span>';
-  if (s === "unfinished") return '<span class="badge" style="background:#fee2e2;color:#991b1b">Unfinished</span>';
+  if (s === "unfinished") return '<span class="badge" style="background:#fee2e2;color:var(--danger-text)">Unfinished</span>';
   return `<span class="badge">${escapeHtml(s||"")}</span>`;
 }
 
@@ -5021,7 +5178,7 @@ function renderProjects() {
           <td>${stateLabel(p.state)}</td>
           <td style="color:var(--muted);font-size:12px" title="${p.git_last_commit_date ? 'Git: last commit ' + escapeHtml(p.git_last_commit_date) + ' (' + (p.git_age_days||0) + 'd ago)' : 'Manual entry'}">
             ${escapeHtml(p.last_work_date || "")}
-            ${p.last_work_source === "git" ? '<span style="display:inline-block;margin-left:4px;padding:1px 5px;border-radius:3px;background:#dbeafe;color:#1e40af;font-size:9px;font-weight:600">git</span>' : ''}
+            ${p.last_work_source === "git" ? '<span style="display:inline-block;margin-left:4px;padding:1px 5px;border-radius:3px;background:var(--info-bg);color:var(--info-text);font-size:9px;font-weight:600">git</span>' : ''}
           </td>
           <td><code style="font-size:11px;color:var(--muted);word-break:break-all">${escapeHtml(pathDisplay)}</code></td>
           <td><span class="desc">${escapeHtml(p.pending || "")}</span></td>
@@ -5113,13 +5270,13 @@ async function discoverProjects() {
   try {
     const r = await fetch("/projects/discover");
     const j = await r.json();
-    if (!j.ok) { panel.innerHTML = `<span style="color:#dc2626">Discover failed: ${escapeHtml(j.error || "unknown")}</span>`; return; }
+    if (!j.ok) { panel.innerHTML = `<span style="color:var(--danger-text)">Discover failed: ${escapeHtml(j.error || "unknown")}</span>`; return; }
     const all = j.discovered || [];
     const untracked = all.filter(d => !d.tracked);
     const tracked = all.filter(d => d.tracked);
 
     let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-      <div style="font-weight:600;color:#1e40af">🔍 Discovered git repos (sorted by most-recent commit)</div>
+      <div style="font-weight:600;color:var(--info-text)">🔍 Discovered git repos (sorted by most-recent commit)</div>
       <button class="tiny" onclick="document.getElementById('discoverPanel').style.display='none'">✕ Close</button>
     </div>`;
     if (all.length === 0) {
@@ -5154,10 +5311,10 @@ async function discoverProjects() {
       </tr>`;
     }
     html += `</tbody></table>`;
-    html += `<div style="margin-top:8px;font-size:11px;color:var(--muted)">Tracked projects auto-pick up their "last work date" from git on every refresh (look for the <span style="display:inline-block;padding:1px 5px;border-radius:3px;background:#dbeafe;color:#1e40af;font-size:9px;font-weight:600">git</span> badge).</div>`;
+    html += `<div style="margin-top:8px;font-size:11px;color:var(--muted)">Tracked projects auto-pick up their "last work date" from git on every refresh (look for the <span style="display:inline-block;padding:1px 5px;border-radius:3px;background:var(--info-bg);color:var(--info-text);font-size:9px;font-weight:600">git</span> badge).</div>`;
     panel.innerHTML = html;
   } catch (e) {
-    panel.innerHTML = `<span style="color:#dc2626">Discover failed: ${escapeHtml(e.message)}</span>`;
+    panel.innerHTML = `<span style="color:var(--danger-text)">Discover failed: ${escapeHtml(e.message)}</span>`;
   }
 }
 
@@ -5364,8 +5521,8 @@ function renderDisk() {
 }
 
 function riskBadgeHtml(risk) {
-  if (risk === "danger") return '<span title="DANGER — contains user state, not just cache" style="display:inline-block;padding:2px 6px;border-radius:4px;background:#fee2e2;color:#991b1b;font-size:10px;font-weight:600">🔴 DANGER</span>';
-  if (risk === "caution") return '<span title="CAUTION — safe but app may need restart or slow regen" style="display:inline-block;padding:2px 6px;border-radius:4px;background:#fef3c7;color:#92400e;font-size:10px;font-weight:600">🟡 CAUTION</span>';
+  if (risk === "danger") return '<span title="DANGER — contains user state, not just cache" style="display:inline-block;padding:2px 6px;border-radius:4px;background:#fee2e2;color:var(--danger-text);font-size:10px;font-weight:600">🔴 DANGER</span>';
+  if (risk === "caution") return '<span title="CAUTION — safe but app may need restart or slow regen" style="display:inline-block;padding:2px 6px;border-radius:4px;background:#fef3c7;color:var(--warn-text);font-size:10px;font-weight:600">🟡 CAUTION</span>';
   return '<span title="SAFE — regenerable from public sources, no app impact" style="display:inline-block;padding:2px 6px;border-radius:4px;background:#d1fae5;color:#065f46;font-size:10px;font-weight:600">🟢 SAFE</span>';
 }
 
@@ -5756,6 +5913,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     continue
             paths = _tcc_paths_for_self()
             self._send(200, json.dumps({"ok": ok, **paths}).encode(), "application/json")
+        elif self.path == "/system/rclone-diagnose":
+            self._send(200, json.dumps(rclone_diagnose()).encode(), "application/json")
         elif self.path == "/system/python-health":
             # Detect whether the running Python is Apple's (which silently fails TCC).
             paths = _tcc_paths_for_self()
