@@ -2421,12 +2421,6 @@ HTML = r"""<!DOCTYPE html>
         <div id="scanBreadcrumbs" style="display:none;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:8px;font-size:13px;display:flex;align-items:center;gap:6px;flex-wrap:wrap"></div>
         <!-- Active archive jobs panel — survives browser refresh, polls every 2s -->
         <div id="archiveJobsPanel" style="display:none;background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:8px 12px;margin-bottom:8px;font-size:12px"></div>
-        <div id="scanLegend" style="font-size:12px;color:var(--muted);margin-bottom:8px;display:none">
-          <span style="display:inline-block;margin-right:14px">🗑 <b>Delete</b> — regenerable</span>
-          <span style="display:inline-block;margin-right:14px">☁️ <b>Archive</b> — cold assets</span>
-          <span style="display:inline-block;margin-right:14px">⚠️ <b>Check</b> — git repos, untracked work risk</span>
-          <span style="display:inline-block">🔒 <b>Keep</b> — source / configs</span>
-        </div>
         <div id="scanTotals" style="display:none;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:8px;font-size:13px"></div>
         <div id="scanActions" style="display:none;margin-bottom:8px">
           <label>Archive to
@@ -4190,19 +4184,19 @@ async function restartServerAndRescan(path) {
 
 function renderScanResult() {
   if (!scanResult) return;
-  document.getElementById("scanLegend").style.display = "block";
   document.getElementById("scanActions").style.display = "block";
   document.getElementById("scanTable").style.display = "table";
   renderBreadcrumbs();
 
   const t = scanResult.totals_bytes || {};
   document.getElementById("scanTotals").style.display = "block";
+  // Hover tooltips replace the standalone legend row (less clutter)
   document.getElementById("scanTotals").innerHTML = `
     <b>Totals:</b>
-    🗑 ${fmtBytes(t.delete || 0)} regenerable ·
-    ☁️ ${fmtBytes(t.archive || 0)} cold ·
-    ⚠️ ${fmtBytes(t.check || 0)} git repos ·
-    🔒 ${fmtBytes(t.keep || 0)} keep`;
+    <span title="Regenerable junk — node_modules, dist, .next, etc. Safe to delete; rebuilt by npm install / docker pull">🗑 ${fmtBytes(t.delete || 0)}</span> ·
+    <span title="Cold assets — PDFs, videos, datasets, ML weights, design files. Non-regenerable. Good for cloud archive.">☁️ ${fmtBytes(t.archive || 0)}</span> ·
+    <span title="Git repos — check for uncommitted/unpushed work before archiving.">⚠️ ${fmtBytes(t.check || 0)}</span> ·
+    <span title="Keep — source code, configs, small files. Don't archive.">🔒 ${fmtBytes(t.keep || 0)}</span>`;
 
   const icon = (c) => ({delete:"🗑", archive:"☁️", check:"⚠️", keep:"🔒"}[c] || "");
   const sorted = [...scanResult.items].sort((a, b) => b.size_bytes - a.size_bytes);
