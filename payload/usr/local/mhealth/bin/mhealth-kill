@@ -1022,8 +1022,19 @@ def _archives_save(items: list[dict]) -> None:
 
 
 def archives_add(entry: dict) -> dict:
+    """Add an archive entry. Deduplicates by id OR remote_path — if either
+    matches an existing entry, REPLACE it (don't create a duplicate). This
+    fixes the import-then-complete race that previously left two registry
+    rows pointing at the same cloud folder."""
     with _ARCHIVES_LOCK:
         items = _archives_load()
+        new_id = entry.get("id")
+        new_remote = entry.get("remote")
+        new_path = entry.get("remote_path")
+        # Drop any existing entry with the same id or same (remote, remote_path)
+        items = [e for e in items
+                 if e.get("id") != new_id
+                 and not (e.get("remote") == new_remote and e.get("remote_path") == new_path)]
         items.insert(0, entry)
         _archives_save(items)
         return entry
