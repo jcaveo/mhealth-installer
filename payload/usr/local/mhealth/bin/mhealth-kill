@@ -705,6 +705,112 @@ def projects_update(item_id: str, raw: dict) -> dict | None:
         return None
 
 
+def _projects_discover_paths() -> list[str]:
+    """Common parent directories where projects live. Auto-discover walks one
+    level deep under each, looking for `.git/` subfolders."""
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, "Documents", "projects"),
+        os.path.join(home, "Desktop", "Work"),
+        os.path.join(home, "Code"),
+        os.path.join(home, "Workspace"),
+        os.path.join(home, "src"),
+        os.path.join(home, "dev"),
+    ]
+    return [p for p in candidates if os.path.isdir(p)]
+
+
+def _git_last_commit_info(repo: str) -> dict | None:
+    """Returns {last_commit_ts (epoch), last_commit_date (YYYY-MM-DD), age_days}
+    for a git repo. None if not a repo / no commits / git unavailable."""
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        return None
+    try:
+        r = subprocess.run(
+            ["git", "-C", repo, "log", "-1", "--format=%ct"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        ts = int(r.stdout.strip())
+        days = max(0, (int(time.time()) - ts) // 86400)
+        date = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        return {"last_commit_ts": ts, "last_commit_date": date, "age_days": days}
+    except Exception:
+        return None
+
+
+def discover_projects() -> dict:
+    """Walk known parent dirs, find git repos, return metadata sorted by
+    most-recent commit first. Each entry includes a 'tracked' flag indicating
+    whether it's already in the projects.json registry."""
+    home = os.path.expanduser("~")
+    parents = _projects_discover_paths()
+    tracked_paths = set()
+    for p in _projects_load():
+        path = (p.get("path") or "").strip()
+        if path:
+            tracked_paths.add(os.path.realpath(os.path.expanduser(path)))
+
+    discovered = []
+    for parent in parents:
+        try:
+            for name in sorted(os.listdir(parent)):
+                full = os.path.join(parent, name)
+                if not os.path.isdir(full) or os.path.islink(full):
+                    continue
+                if not os.path.isdir(os.path.join(full, ".git")):
+                    continue
+                info = _git_last_commit_info(full)
+                # Display path with ~/ prefix
+                display = "~/" + full[len(home) + 1:] if full.startswith(home + "/") else full
+                discovered.append({
+                    "name": name,
+                    "path": display,
+                    "abs_path": full,
+                    "tracked": os.path.realpath(full) in tracked_paths,
+                    "last_commit_ts": info["last_commit_ts"] if info else None,
+                    "last_commit_date": info["last_commit_date"] if info else None,
+                    "age_days": info["age_days"] if info else None,
+                })
+        except (PermissionError, FileNotFoundError):
+            continue
+
+    # Most recent commit first; repos with no commits go last
+    discovered.sort(key=lambda d: -(d["last_commit_ts"] or 0))
+    return {
+        "ok": True,
+        "discovered": discovered,
+        "parents_scanned": parents,
+    }
+
+
+def _enrich_projects_with_activity(projects: list[dict]) -> list[dict]:
+    """For each project whose path is a git repo, auto-update last_work_date
+    from the most recent commit if the commit is more recent than what's stored."""
+    for p in projects:
+        path = (p.get("path") or "").strip()
+        if not path:
+            continue
+        abs_path = os.path.expanduser(path)
+        if not os.path.isdir(abs_path):
+            continue
+        info = _git_last_commit_info(abs_path)
+        if not info:
+            continue
+        git_date = info["last_commit_date"]
+        manual_date = (p.get("last_work_date") or "")
+        # Use the more recent of (manual entry, git commit)
+        if git_date > manual_date:
+            p["last_work_date"] = git_date
+            p["last_work_source"] = "git"
+        else:
+            p["last_work_source"] = "manual"
+        p["git_last_commit_date"] = git_date
+        p["git_age_days"] = info["age_days"]
+    return projects
+
+
 def projects_remove(item_id: str) -> bool:
     with _PROJECTS_LOCK:
         items = _projects_load()
@@ -2476,6 +2582,7 @@ HTML = r"""<!DOCTYPE html>
     </h2>
     <div class="toolbar">
       <button onclick="openProjectModal()">+ Add project</button>
+      <button onclick="discoverProjects()" title="Walk ~/Documents/projects, ~/Desktop/Work, etc. for git repos and show them sorted by most-recent commit">🔍 Discover repos</button>
       <button onclick="refreshProjects()">Refresh</button>
       <label style="margin-left:14px">Filter
         <select id="projFilter" onchange="renderProjects()">
@@ -2487,6 +2594,7 @@ HTML = r"""<!DOCTYPE html>
       </label>
       <span class="status" id="projStatus"></span>
     </div>
+    <div id="discoverPanel" style="display:none;background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:12px 16px;margin-bottom:10px;font-size:12px"></div>
     <table id="projTable">
       <colgroup>
         <col style="width:160px">
@@ -4786,7 +4894,10 @@ function renderProjects() {
           <td><b>${escapeHtml(p.name || "")}</b></td>
           <td><span class="desc">${escapeHtml(p.description || "")}</span></td>
           <td>${stateLabel(p.state)}</td>
-          <td style="color:var(--muted);font-size:12px">${escapeHtml(p.last_work_date || "")}</td>
+          <td style="color:var(--muted);font-size:12px" title="${p.git_last_commit_date ? 'Git: last commit ' + escapeHtml(p.git_last_commit_date) + ' (' + (p.git_age_days||0) + 'd ago)' : 'Manual entry'}">
+            ${escapeHtml(p.last_work_date || "")}
+            ${p.last_work_source === "git" ? '<span style="display:inline-block;margin-left:4px;padding:1px 5px;border-radius:3px;background:#dbeafe;color:#1e40af;font-size:9px;font-weight:600">git</span>' : ''}
+          </td>
           <td><code style="font-size:11px;color:var(--muted);word-break:break-all">${escapeHtml(pathDisplay)}</code></td>
           <td><span class="desc">${escapeHtml(p.pending || "")}</span></td>
           <td>
@@ -4868,6 +4979,87 @@ async function saveProject(ev) {
   } catch (e) {
     alert("Save failed: " + e.message);
   }
+}
+
+async function discoverProjects() {
+  const panel = document.getElementById("discoverPanel");
+  panel.style.display = "block";
+  panel.innerHTML = `<span style="color:var(--muted)">Scanning for git repos under ~/Documents/projects, ~/Desktop/Work, ~/Code, ~/Workspace, ~/src, ~/dev…</span>`;
+  try {
+    const r = await fetch("/projects/discover");
+    const j = await r.json();
+    if (!j.ok) { panel.innerHTML = `<span style="color:#dc2626">Discover failed: ${escapeHtml(j.error || "unknown")}</span>`; return; }
+    const all = j.discovered || [];
+    const untracked = all.filter(d => !d.tracked);
+    const tracked = all.filter(d => d.tracked);
+
+    let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+      <div style="font-weight:600;color:#1e40af">🔍 Discovered git repos (sorted by most-recent commit)</div>
+      <button class="tiny" onclick="document.getElementById('discoverPanel').style.display='none'">✕ Close</button>
+    </div>`;
+    if (all.length === 0) {
+      html += `<div style="color:var(--muted)">No git repos found in any of the scanned parent dirs:</div>
+        <code style="font-size:11px;color:var(--muted);display:block;margin-top:4px">${(j.parents_scanned||[]).map(escapeHtml).join("<br>")}</code>`;
+      panel.innerHTML = html;
+      return;
+    }
+    html += `<table style="width:100%;font-size:12px;margin-top:4px">
+      <thead><tr>
+        <th style="text-align:left">Repo</th>
+        <th style="text-align:left">Path</th>
+        <th style="text-align:left">Last commit</th>
+        <th></th>
+      </tr></thead><tbody>`;
+    for (const d of all) {
+      const ageStr = d.age_days == null ? "(no commits)" :
+                     d.age_days === 0 ? `today` :
+                     d.age_days === 1 ? `yesterday` :
+                     d.age_days < 30 ? `${d.age_days}d ago` :
+                     d.age_days < 365 ? `${Math.floor(d.age_days/30)}mo ago` :
+                     `${Math.floor(d.age_days/365)}y ago`;
+      const dateStr = d.last_commit_date || "—";
+      const trackedBadge = d.tracked
+        ? `<span style="color:#16a34a;font-weight:500">✓ tracked</span>`
+        : `<button class="tiny" onclick="addDiscoveredProject('${escapeHtml(d.name)}','${escapeHtml(d.path)}','${dateStr}')">+ Add to tracker</button>`;
+      html += `<tr>
+        <td><b>${escapeHtml(d.name)}</b></td>
+        <td><code style="font-size:11px;color:var(--muted)">${escapeHtml(d.path)}</code></td>
+        <td title="${escapeHtml(dateStr)}" style="color:var(--muted)">${escapeHtml(ageStr)}</td>
+        <td>${trackedBadge}</td>
+      </tr>`;
+    }
+    html += `</tbody></table>`;
+    html += `<div style="margin-top:8px;font-size:11px;color:var(--muted)">Tracked projects auto-pick up their "last work date" from git on every refresh (look for the <span style="display:inline-block;padding:1px 5px;border-radius:3px;background:#dbeafe;color:#1e40af;font-size:9px;font-weight:600">git</span> badge).</div>`;
+    panel.innerHTML = html;
+  } catch (e) {
+    panel.innerHTML = `<span style="color:#dc2626">Discover failed: ${escapeHtml(e.message)}</span>`;
+  }
+}
+
+async function addDiscoveredProject(name, path, lastWorkDate) {
+  // Auto-derive a state: if last commit < 30d → in_progress, else unfinished.
+  // User can edit immediately via the Edit modal.
+  const project = {
+    name, path,
+    description: "(auto-discovered from git — edit description here)",
+    state: "in_progress",
+    last_work_date: lastWorkDate || new Date().toISOString().slice(0, 10),
+    pending: "",
+  };
+  try {
+    const r = await fetch("/projects", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({op: "add", project}),
+    });
+    const j = await r.json();
+    if (j.ok) {
+      refreshProjects();
+      // Re-run discover to show the ✓ tracked badge
+      setTimeout(() => discoverProjects(), 400);
+    } else {
+      alert("Add failed: " + (j.error || "unknown"));
+    }
+  } catch (e) { alert("Add failed: " + e.message); }
 }
 
 async function deleteProject(id, name) {
@@ -5326,8 +5518,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             payload = json.dumps({"items": _readlater_load()}).encode()
             self._send(200, payload, "application/json")
         elif self.path == "/projects":
-            payload = json.dumps({"items": _projects_ensure_seeded()}).encode()
+            items = _projects_ensure_seeded()
+            items = _enrich_projects_with_activity(items)
+            payload = json.dumps({"items": items}).encode()
             self._send(200, payload, "application/json")
+        elif self.path == "/projects/discover":
+            self._send(200, json.dumps(discover_projects()).encode(), "application/json")
         elif self.path == "/cloud":
             remotes = []
             for r in rclone_remotes():
