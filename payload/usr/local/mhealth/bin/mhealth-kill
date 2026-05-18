@@ -2320,11 +2320,11 @@ HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="tabs">
-    <div class="tab active" data-pane="tabs" onclick="switchTab('tabs')">Tabs</div>
+    <div class="tab active" data-pane="archive" onclick="switchTab('archive')">Cloud Sync</div>
+    <div class="tab" data-pane="tabs" onclick="switchTab('tabs')">Tabs</div>
     <div class="tab" data-pane="processes" onclick="switchTab('processes')">Processes</div>
     <div class="tab" data-pane="readlater" onclick="switchTab('readlater')">Read Later</div>
     <div class="tab" data-pane="caches" onclick="switchTab('caches')">Caches</div>
-    <div class="tab" data-pane="archive" onclick="switchTab('archive')">Cloud Sync</div>
     <div class="tab" data-pane="projects" onclick="switchTab('projects')">Projects</div>
     <div class="tab" data-pane="time" onclick="switchTab('time')" id="timeSpentTab" style="display:none">Time Spent</div>
     <div class="tab" data-pane="cloudsetup" onclick="switchTab('cloudsetup')">Cloud Setup</div>
@@ -2368,7 +2368,7 @@ HTML = r"""<!DOCTYPE html>
     </table>
   </div>
 
-  <div id="pane-tabs" class="pane active">
+  <div id="pane-tabs" class="pane">
     <h2>Browser Tabs <span id="tabCount" style="color:var(--muted);font-weight:400">(0)</span>
       <span style="font-weight:400;color:var(--muted);font-size:12px;margin-left:8px">
         · Closing a tab cleanly frees its renderer (no "Aw, Snap!")
@@ -2485,7 +2485,7 @@ HTML = r"""<!DOCTYPE html>
     </table>
   </div>
 
-  <div id="pane-archive" class="pane">
+  <div id="pane-archive" class="pane active">
     <h2 style="margin:0 0 6px;font-size:17px">Cloud Sync
       <span style="font-weight:400;color:var(--muted);font-size:12px;margin-left:8px">
         · Free disk space by sending cold project files to cloud. Scan a folder → mhealth classifies → delete regenerable, archive cold assets, keep source. Restore from cloud anytime.
