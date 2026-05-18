@@ -4,20 +4,21 @@ Mac monitoring + activity + cloud archive dashboard, packaged as a one-click `.p
 
 **Dashboard:** `http://127.0.0.1:8765/` (after install)
 
-## Tabs
+## Tabs (in order)
 
 | Tab | Purpose |
 |-----|---------|
+| **Cloud Sync** | The main feature. Scan any folder → classifier categorizes items (🗑 delete / ☁️ archive / ⚠️ check git / 🔒 keep) → bulk-archive to cloud via rclone. Background jobs survive browser refresh. Verify · Restore · Re-archive · Delete-local-after-verify per item. |
 | **Tabs** | Chrome/Brave tab manager with duplicate detection + Save & Close to Read Later |
 | **Processes** | Process list with safe kill (critical processes protected) |
 | **Read Later** | URLs you saved from the Tabs tab |
-| **Caches** | System cache cleanup (npm/Docker/Homebrew/Chrome/etc.) with risk levels |
-| **Archive** | Folder scanner + cloud upload/restore via rclone (BYO Drive/Mega/R2/etc.) |
-| **Projects** | Tracker for projects built with Claude |
-| **Cloud Setup** | Configure rclone remotes (one-time per dev) |
-| ~~Time Spent~~ | **Hidden by default** for privacy. See [TODO_HIDDEN_FEATURES.md](TODO_HIDDEN_FEATURES.md) — opt-in via `MHEALTH_ENABLE_TIME_SPENT=1 mhealth-setup` |
+| **Caches** | System cache cleanup (npm/Docker/Homebrew/Gradle/CocoaPods/Xcode/etc.) with 🟢🟡🔴 risk levels |
+| **Projects** | Manual project tracker + 🔍 Discover auto-finds git repos under ~/Documents/projects, ~/Desktop/Work, ~/Code, ~/Workspace, ~/src, ~/dev. Tracked projects auto-update "Last work" date from git commits. |
+| **Cloud Setup** | Configure rclone remotes — 8 supported (R2, Mega, Drive, Box, Dropbox, OneDrive, pCloud, Storj) with inline setup recipes |
 
 Plus a snooze widget in the top-right to silence health-watcher notifications for 15min / 1hr / 2hr / until tomorrow.
+
+The **Time Spent** tab was removed for privacy. The activity logger still collects data to `~/Library/Logs/mhealth-activity.csv` (transparently disclosed in INSTALL.md §5). To stop collection entirely, see INSTALL.md §5.
 
 ## For end users
 

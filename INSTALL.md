@@ -211,13 +211,13 @@ Then:
 
 | Tab            | Purpose                                                              |
 |----------------|----------------------------------------------------------------------|
-| Browser Tabs   | Open Chrome/Brave tabs with duplicate detection + Save & Close       |
-| Processes      | Process list with safe kill (critical processes protected)           |
-| Read Later     | Tabs you've saved for later                                          |
-| Disk Cleanup   | System cache scan (npm, Docker, Homebrew, Trash, etc.) — quick clean |
-| Time Spent     | Activity-log-based app + browser + shell usage analysis              |
-| Projects       | Tracker for projects you're building (state, path, pending tasks)    |
-| Cloud Archive  | Folder classifier + cloud upload/restore for cold project assets     |
+| **Cloud Sync** | **Main feature.** Scan any folder → classifier categorizes items → bulk-archive cold assets to cloud. Background jobs survive refresh. Verify · Restore · Re-archive · safe Delete-local. |
+| Tabs           | Chrome/Brave tab manager with duplicate detection + Save & Close      |
+| Processes      | Process list with safe kill (critical processes protected)            |
+| Read Later     | Tabs you've saved for later                                           |
+| Caches         | System cache scan with risk levels (🟢 safe / 🟡 caution / 🔴 danger) |
+| Projects       | Tracker + 🔍 Discover auto-finds git repos and auto-updates dates from commits |
+| Cloud Setup    | Configure rclone remotes (8 providers: R2, Mega, Drive, Box, Dropbox, OneDrive, pCloud, Storj) |
 
 ---
 
@@ -244,7 +244,7 @@ rm ~/Library/LaunchAgents/com.mhealth.watcher.plist
 rm ~/Library/Logs/mac-health-watcher.log
 ```
 
-The Time Spent dashboard tab (which would visualize the activity log) is hidden by default. To enable it for your account: `MHEALTH_ENABLE_TIME_SPENT=1 mhealth-setup`.
+The dashboard intentionally has no UI for the activity log — the Time Spent tab was removed for privacy. To re-enable it, edit `payload/usr/local/mhealth/bin/mhealth-kill` and remove the `style="display:none"` on `#timeSpentTab` (one line).
 
 ---
 
