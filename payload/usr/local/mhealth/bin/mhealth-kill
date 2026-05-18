@@ -1093,6 +1093,51 @@ def rclone_size_bytes(target: str, timeout: int = 60) -> int:
         return -1
 
 
+def rclone_setup_mega(name: str, user: str, password: str) -> dict:
+    """One-click Mega remote setup. Runs `rclone config create` non-interactively
+    and verifies the credentials by listing the remote. On failure, removes
+    the bad config so we don't leave a broken remote behind."""
+    exe = _which_rclone()
+    if not exe:
+        return {"ok": False, "error": "rclone not installed"}
+    name = (name or "mega").strip()
+    user = (user or "").strip()
+    if not user or "@" not in user:
+        return {"ok": False, "error": "valid email required"}
+    if not password:
+        return {"ok": False, "error": "password required"}
+    # Refuse to overwrite an existing remote — user must rename or delete first
+    existing = {r["name"] for r in rclone_remotes()}
+    if name in existing:
+        return {"ok": False, "error": f"remote '{name}' already exists; delete it or pick a different name"}
+
+    # Create (rclone obscures the password automatically when writing config)
+    try:
+        r = subprocess.run(
+            [exe, "config", "create", name, "mega", "user", user, "pass", password,
+             "--non-interactive"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"rclone config create failed: {e}"}
+
+    if r.returncode != 0:
+        return {"ok": False, "error": f"rclone config create failed: {(r.stderr or r.stdout)[:300]}"}
+
+    # Verify creds by listing the remote root (small + cheap)
+    try:
+        v = subprocess.run([exe, "lsd", f"{name}:"], capture_output=True, text=True, timeout=20)
+    except Exception:
+        v = None
+    if v is None or v.returncode != 0:
+        # Bad creds → rollback the broken config so user doesn't see a broken remote
+        subprocess.run([exe, "config", "delete", name], capture_output=True, timeout=10)
+        msg = (v.stderr if v else "verify timed out") or "verify failed"
+        return {"ok": False, "error": f"login check failed — wrong email/password? rclone said: {msg[:300]}"}
+
+    return {"ok": True, "remote": name, "type": "mega"}
+
+
 def rclone_run(args: list[str], timeout: int = 3600) -> tuple[int, str, str]:
     exe = _which_rclone()
     if not exe:
@@ -3607,6 +3652,80 @@ const PROVIDER_CATALOG = [
     match: r => r.type === "storj" },
 ];
 
+// ---- One-click Mega setup modal ----
+function openMegaQuickSetup() {
+  // Close any existing modal
+  document.querySelectorAll(".mega-quick-modal").forEach(m => m.remove());
+  const m = document.createElement("div");
+  m.className = "mega-quick-modal";
+  m.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:10000;display:flex;align-items:center;justify-content:center";
+  m.innerHTML = `
+    <div style="background:#fff;border-radius:10px;padding:20px 24px;max-width:440px;width:92%;box-shadow:0 12px 48px rgba(0,0,0,0.3)">
+      <h3 style="margin:0 0 4px;font-size:16px">⚡ Quick Mega setup</h3>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:14px">
+        No Terminal needed. Your password is sent over 127.0.0.1 only (never leaves your Mac),
+        then stored encrypted by rclone at <code style="font-size:11px">~/.config/rclone/rclone.conf</code>.
+      </div>
+      <div id="megaQuickError" style="display:none;background:#fef2f2;border:1px solid #fecaca;color:#991b1b;border-radius:6px;padding:8px 12px;margin-bottom:10px;font-size:12px"></div>
+      <form id="megaQuickForm" onsubmit="submitMegaQuickSetup(event)">
+        <div style="display:grid;grid-template-columns:90px 1fr;gap:8px 12px;align-items:center;font-size:13px">
+          <label>Remote name</label>
+          <input id="megaName" type="text" value="mega" maxlength="40" style="padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:13px">
+          <label>Mega email</label>
+          <input id="megaUser" type="email" autocomplete="username" required style="padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:13px">
+          <label>Mega password</label>
+          <input id="megaPass" type="password" autocomplete="current-password" required style="padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:13px">
+        </div>
+        <div style="font-size:11px;color:var(--muted);margin-top:8px">
+          No Mega account yet? <a href="https://mega.io" target="_blank" rel="noopener" style="color:var(--accent)">Sign up at mega.io</a> (20 GB free).
+        </div>
+        <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
+          <button type="button" onclick="this.closest('.mega-quick-modal').remove()">Cancel</button>
+          <button type="submit" id="megaQuickSubmit" style="background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600">Set up</button>
+        </div>
+      </form>
+    </div>`;
+  document.body.appendChild(m);
+  // ESC dismisses
+  document.addEventListener("keydown", function esc(e) {
+    if (e.key === "Escape") { m.remove(); document.removeEventListener("keydown", esc); }
+  });
+  setTimeout(() => document.getElementById("megaUser").focus(), 50);
+}
+
+async function submitMegaQuickSetup(ev) {
+  ev.preventDefault();
+  const name = document.getElementById("megaName").value.trim() || "mega";
+  const user = document.getElementById("megaUser").value.trim();
+  const password = document.getElementById("megaPass").value;
+  const btn = document.getElementById("megaQuickSubmit");
+  const errEl = document.getElementById("megaQuickError");
+  errEl.style.display = "none";
+  btn.disabled = true;
+  btn.textContent = "Logging in to Mega…";
+  try {
+    const r = await fetch("/cloud/setup-mega", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({name, user, password}),
+    });
+    const j = await r.json();
+    if (j.ok) {
+      document.querySelector(".mega-quick-modal").remove();
+      refreshCloud();  // surface the new remote in the providers grid
+    } else {
+      errEl.textContent = j.error || "Setup failed.";
+      errEl.style.display = "block";
+      btn.disabled = false;
+      btn.textContent = "Set up";
+    }
+  } catch (e) {
+    errEl.textContent = "Network error: " + e.message;
+    errEl.style.display = "block";
+    btn.disabled = false;
+    btn.textContent = "Set up";
+  }
+}
+
 // Render the providers grid: configured ones show usage; unconfigured show "Set up →"
 function renderProvidersGrid() {
   const gridEl = document.getElementById("providersGrid");
@@ -3634,9 +3753,15 @@ function renderProvidersGrid() {
         <div style="font-size:11px;color:#6b7280">Remote name: <code>${escapeHtml(matched.name)}</code></div>
         ${bar}${usage}`;
     } else {
+      // Mega supports one-click in-app setup (just needs email + password).
+      // OAuth providers (Drive/Dropbox/etc.) still need rclone config in Terminal.
+      const quickBtn = p.id === "mega"
+        ? `<button onclick="openMegaQuickSetup()" style="width:100%;padding:6px;border:none;background:var(--accent);color:#fff;border-radius:6px;cursor:pointer;font-weight:500;margin-bottom:6px">⚡ Quick setup (no Terminal)</button>`
+        : "";
       bodyHtml = `
         <div style="font-size:11px;color:#6b7280;margin:4px 0 8px;min-height:30px">${escapeHtml(p.blurb)}</div>
-        <button onclick="showRecipe('${p.id}')" style="width:100%;padding:6px;border:1px solid var(--accent);background:#fff;color:var(--accent);border-radius:6px;cursor:pointer;font-weight:500">Set up →</button>`;
+        ${quickBtn}
+        <button onclick="showRecipe('${p.id}')" style="width:100%;padding:6px;border:1px solid var(--accent);background:#fff;color:var(--accent);border-radius:6px;cursor:pointer;font-weight:500">Set up via Terminal →</button>`;
     }
     return `<div style="border:2px solid ${cardBorder};border-radius:10px;overflow:hidden">
       <div style="padding:8px 12px;background:${headerBg};display:flex;justify-content:space-between;align-items:center">
@@ -5939,6 +6064,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/cloud/backfill-sizes":
             result = archives_backfill_sizes()
             self._send(200, json.dumps(result).encode(), "application/json")
+
+        elif self.path == "/cloud/setup-mega":
+            try:
+                payload_in = json.loads(body)
+            except Exception:
+                self._send(400, b'{"ok":false,"error":"invalid json"}', "application/json"); return
+            result = rclone_setup_mega(
+                name=(payload_in.get("name") or "mega").strip(),
+                user=(payload_in.get("user") or "").strip(),
+                password=(payload_in.get("password") or ""),
+            )
+            self._send(200 if result.get("ok") else 400, json.dumps(result).encode(), "application/json")
 
         elif self.path == "/cloud/import-orphan":
             try:
