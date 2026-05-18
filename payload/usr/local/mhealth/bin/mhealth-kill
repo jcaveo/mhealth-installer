@@ -1103,6 +1103,28 @@ def _jobs_load_at_startup() -> None:
 _jobs_load_at_startup()
 
 
+def jobs_remove(job_id: str) -> bool:
+    """Drop a single job from the registry (and persist)."""
+    with _JOBS_LOCK:
+        if job_id in ARCHIVE_JOBS:
+            del ARCHIVE_JOBS[job_id]
+            _jobs_save_locked()
+            return True
+        return False
+
+
+def jobs_clear_terminal() -> int:
+    """Drop all done/failed/interrupted jobs. Keeps queued/running. Returns count cleared."""
+    with _JOBS_LOCK:
+        terminal_ids = [jid for jid, j in ARCHIVE_JOBS.items()
+                        if j.get("status") in ("done", "failed", "interrupted")]
+        for jid in terminal_ids:
+            del ARCHIVE_JOBS[jid]
+        if terminal_ids:
+            _jobs_save_locked()
+        return len(terminal_ids)
+
+
 def _job_set(job_id: str, **updates) -> None:
     with _JOBS_LOCK:
         if job_id in ARCHIVE_JOBS:
@@ -4339,9 +4361,22 @@ async function refreshJobs() {
   }
 }
 
+// Jobs panel state — minimize is persisted to localStorage
+const JOBS_MIN_KEY = "mhealth.jobsPanelMinimized";
+function isJobsPanelMinimized() {
+  return localStorage.getItem(JOBS_MIN_KEY) === "1";
+}
+function setJobsPanelMinimized(min) {
+  localStorage.setItem(JOBS_MIN_KEY, min ? "1" : "0");
+  if (lastJobsRendered) renderJobs(lastJobsRendered);  // re-render with new state
+}
+
+let lastJobsRendered = null;  // cache so toggle button can re-render without re-fetching
+
 function renderJobs(jobs) {
   const el = document.getElementById("archiveJobsPanel");
   if (!el) return;
+  lastJobsRendered = jobs;
   if (jobs.length === 0) { el.style.display = "none"; return; }
 
   const fmtDur = (sec) => {
@@ -4357,53 +4392,109 @@ function renderJobs(jobs) {
     if (a < 86400) return Math.floor(a/3600) + "h ago";
     return Math.floor(a/86400) + "d ago";
   };
-  const fmtAbsTime = (epochSec) => {
+  const fmtAbsDateTime = (epochSec) => {
     if (!epochSec) return "";
     const d = new Date(epochSec * 1000);
-    return d.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+    // e.g. "May 17, 7:18 PM"
+    return d.toLocaleString([], {month: "short", day: "numeric", hour: "numeric", minute: "2-digit"});
   };
 
   const now = Date.now() / 1000;
-  const recent = jobs.slice(0, 10);  // show most recent 10
-  const html = recent.map(j => {
-    let icon, label, color;
-    if (j.status === "queued") { icon = "⏳"; label = "queued"; color = "#6b7280"; }
-    else if (j.status === "running") { icon = "🔄"; label = j.stage === "check" ? "verifying" : "uploading"; color = "#0369a1"; }
-    else if (j.status === "done") { icon = "✓"; label = "done"; color = "#16a34a"; }
-    else if (j.status === "interrupted") { icon = "⚠️"; label = "interrupted (server restart)"; color = "#d97706"; }
-    else { icon = "✗"; label = "failed"; color = "#dc2626"; }
+  const active = jobs.filter(j => j.status === "queued" || j.status === "running");
+  const done = jobs.filter(j => j.status === "done");
+  const failed = jobs.filter(j => j.status === "failed" || j.status === "interrupted");
 
-    // Time display: active jobs show how long they've been running.
-    // Terminal jobs show how long the upload took + when it ended.
-    let timeHtml;
+  // ── MINIMIZED MODE: show one compact bar with summary
+  if (isJobsPanelMinimized()) {
+    const summary = [];
+    if (active.length) summary.push(`<b style="color:#0369a1">${active.length} uploading</b>`);
+    if (done.length)   summary.push(`<span style="color:#374151">${done.length} done</span>`);
+    if (failed.length) summary.push(`<span style="color:#dc2626">${failed.length} failed</span>`);
+    el.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center">
+      <div>📋 Archive jobs: ${summary.join(" · ") || "none"}${active.length ? ` <span style="color:#6b7280;margin-left:8px">(${escapeHtml(active[0].name || "")} · ${fmtDur(now - (active[0].started_at || now))})</span>` : ""}</div>
+      <button class="tiny" onclick="setJobsPanelMinimized(false)" title="Expand jobs panel">▼ Expand</button>
+    </div>`;
+    el.style.display = "block";
+    return;
+  }
+
+  // ── EXPANDED MODE: full job list with per-row controls
+  const recent = jobs.slice(0, 20);
+  const html = recent.map(j => {
+    // BLACK/WHITE for done (per user request: subdued, not green); colored for active/error
+    let icon, label, color, bg = "transparent";
+    if (j.status === "queued") {
+      icon = "⏳"; label = "queued"; color = "#6b7280";
+    } else if (j.status === "running") {
+      // ACTIVE upload — distinct blue color so it stands out
+      icon = "🔄"; label = j.stage === "check" ? "verifying" : "uploading"; color = "#0369a1";
+      bg = "#dbeafe";  // light blue background for the active row
+    } else if (j.status === "done") {
+      icon = "✓"; label = "done"; color = "#111827";  // black/white — neutral
+    } else if (j.status === "interrupted") {
+      icon = "⚠️"; label = "interrupted (server restart)"; color = "#d97706";
+    } else {
+      icon = "✗"; label = "failed"; color = "#dc2626";
+    }
+
     const startedAt = j.started_at || 0;
     const endedAt = j.ended_at || 0;
+    let timeHtml;
     if (j.status === "queued" || j.status === "running") {
-      const elapsed = now - startedAt;
-      timeHtml = `<span style="color:#6b7280" title="started at ${escapeHtml(fmtAbsTime(startedAt))}">running for ${fmtDur(elapsed)}</span>`;
+      timeHtml = `<span style="color:#6b7280" title="started at ${escapeHtml(fmtAbsDateTime(startedAt))}">running for ${fmtDur(now - startedAt)}</span>`;
     } else if (endedAt > startedAt) {
       const duration = endedAt - startedAt;
-      const ago = now - endedAt;
-      timeHtml = `<span style="color:#6b7280" title="started ${escapeHtml(fmtAbsTime(startedAt))} · ended ${escapeHtml(fmtAbsTime(endedAt))}">took ${fmtDur(duration)} · ${fmtAgo(ago)}</span>`;
+      timeHtml = `<span style="color:#6b7280" title="${escapeHtml(fmtAbsDateTime(endedAt))}">took ${fmtDur(duration)} · ${fmtAgo(now - endedAt)} (${escapeHtml(fmtAbsDateTime(endedAt))})</span>`;
     } else {
-      timeHtml = `<span style="color:#6b7280" title="started at ${escapeHtml(fmtAbsTime(startedAt))}">${fmtAgo(now - startedAt)}</span>`;
+      timeHtml = `<span style="color:#6b7280" title="${escapeHtml(fmtAbsDateTime(startedAt))}">${fmtAgo(now - startedAt)} (${escapeHtml(fmtAbsDateTime(startedAt))})</span>`;
     }
 
     const errPart = j.error ? `<div style="color:#dc2626;margin-top:2px;font-size:11px">→ ${escapeHtml(j.error.slice(0, 200))}</div>` : "";
-    return `<div style="padding:4px 0;border-top:1px solid #dbeafe">
-      <span style="color:${color};font-weight:600">${icon} ${label}</span>
-      <span style="margin:0 6px;color:#6b7280">·</span>
-      <code style="font-size:11px;word-break:break-all">${escapeHtml(j.name || j.path || "")}</code>
-      <span style="margin:0 6px;color:#6b7280">·</span>
-      <span style="color:#6b7280">${escapeHtml(j.remote || "")}</span>
-      <span style="margin:0 6px;color:#6b7280">·</span>
-      ${timeHtml}
-      ${errPart}
+    // ✕ dismiss button only on terminal-state jobs (don't let user dismiss a running upload)
+    const isTerminal = j.status === "done" || j.status === "failed" || j.status === "interrupted";
+    const dismissBtn = isTerminal
+      ? `<button onclick="dismissJob('${escapeHtml(j.id)}')" title="Remove this log entry" style="margin-left:auto;background:transparent;border:none;color:#9ca3af;cursor:pointer;font-size:14px;padding:0 4px">✕</button>`
+      : "";
+
+    return `<div style="padding:6px 8px;border-top:1px solid #dbeafe;background:${bg};display:flex;align-items:flex-start;gap:6px">
+      <div style="flex:1;min-width:0">
+        <span style="color:${color};font-weight:600">${icon} ${label}</span>
+        <span style="margin:0 6px;color:#6b7280">·</span>
+        <code style="font-size:11px;word-break:break-all">${escapeHtml(j.name || j.path || "")}</code>
+        <span style="margin:0 6px;color:#6b7280">·</span>
+        <span style="color:#6b7280">${escapeHtml(j.remote || "")}</span>
+        <span style="margin:0 6px;color:#6b7280">·</span>
+        ${timeHtml}
+        ${errPart}
+      </div>
+      ${dismissBtn}
     </div>`;
   }).join("");
-  const active = jobs.filter(j => j.status === "queued" || j.status === "running").length;
-  el.innerHTML = `<div style="font-weight:600;color:#1e40af;margin-bottom:4px">Active archive jobs ${active ? `(${active} running)` : "(all complete)"}</div>${html}`;
+
+  const terminalCount = done.length + failed.length;
+  el.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+    <div style="font-weight:600;color:#1e40af">Active archive jobs ${active.length ? `(${active.length} running)` : "(all complete)"}</div>
+    <div style="display:flex;gap:6px">
+      ${terminalCount > 0 ? `<button class="tiny" onclick="clearAllDoneJobs()" title="Remove all completed/failed/interrupted entries from this list">Clear ${terminalCount} log${terminalCount===1?'':'s'}</button>` : ""}
+      <button class="tiny" onclick="setJobsPanelMinimized(true)" title="Minimize panel — keep a one-line status bar">▲ Minimize</button>
+    </div>
+  </div>${html}`;
   el.style.display = "block";
+}
+
+async function dismissJob(jobId) {
+  try {
+    await fetch("/cloud/jobs?id=" + encodeURIComponent(jobId), { method: "DELETE" });
+    refreshJobs();
+  } catch (e) { alert("Dismiss failed: " + e.message); }
+}
+
+async function clearAllDoneJobs() {
+  if (!confirm("Clear all completed / failed / interrupted job logs?\n\nActive (uploading / queued) jobs are kept. Cleared logs cannot be recovered.")) return;
+  try {
+    await fetch("/cloud/jobs?all=1", { method: "DELETE" });
+    refreshJobs();
+  } catch (e) { alert("Clear failed: " + e.message); }
 }
 
 // Poll jobs whenever Archive tab is opened (catches jobs started in another tab)
@@ -5750,6 +5841,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             iid = params.get("id", [""])[0]
             result = delete_archive(iid)
             self._send(200, json.dumps(result).encode(), "application/json")
+        elif u.path == "/cloud/jobs":
+            params = parse_qs(u.query)
+            if params.get("all", [""])[0] == "1":
+                n = jobs_clear_terminal()
+                self._send(200, json.dumps({"ok": True, "cleared": n}).encode(), "application/json")
+            else:
+                iid = params.get("id", [""])[0]
+                ok = jobs_remove(iid)
+                self._send(200, json.dumps({"ok": ok}).encode(), "application/json")
         else:
             self._send(404, b"not found", "text/plain")
 
