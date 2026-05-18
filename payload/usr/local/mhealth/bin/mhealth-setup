@@ -50,14 +50,13 @@ fi
 
 # All three jobs install by default:
 #   watcher  — 5-min health sampler (notifications)
-#   activity — 1-min foreground-app / browser-tab / idle logger to ~/Library/Logs/mhealth-activity.csv
+#   activity — 1-min foreground-app / browser-tab / idle logger to
+#              ~/Library/Logs/mhealth-activity.csv (backend data only;
+#              there is no dashboard UI for it — the Time Spent tab was
+#              removed for privacy)
 #   server   — always-on dashboard at http://127.0.0.1:8765/
 #
-# The Time Spent TAB in the dashboard is hidden by default (privacy optics).
-# To reveal the tab, set MHEALTH_ENABLE_TIME_SPENT=1 (this also adds the env var
-# to the server's plist so the server tells the UI to show the tab).
-#
-# To DISABLE data collection entirely, run:
+# To DISABLE the activity logger (stop collecting data):
 #   launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.mhealth.activity.plist
 #   rm ~/Library/LaunchAgents/com.mhealth.activity.plist
 # Data file:  ~/Library/Logs/mhealth-activity.csv  (rm it any time)
@@ -85,25 +84,7 @@ for job in $JOBS; do
   fi
 done
 
-# If activity is opted-in, also pass MHEALTH_ENABLE_TIME_SPENT to the server
-# so the dashboard reveals the Time Spent tab.
-if [ "${MHEALTH_ENABLE_TIME_SPENT:-0}" = "1" ]; then
-  SERVER_PLIST="$LAUNCH_DIR/com.mhealth.server.plist"
-  if [ -f "$SERVER_PLIST" ] && ! grep -q "MHEALTH_ENABLE_TIME_SPENT" "$SERVER_PLIST"; then
-    # Insert EnvironmentVariables block before </dict>
-    python3 - "$SERVER_PLIST" <<'PY'
-import sys, plistlib
-p = sys.argv[1]
-with open(p, "rb") as f:
-    plist = plistlib.load(f)
-plist.setdefault("EnvironmentVariables", {})["MHEALTH_ENABLE_TIME_SPENT"] = "1"
-with open(p, "wb") as f:
-    plistlib.dump(plist, f)
-PY
-    launchctl bootout "gui/${UID_NUM}" "$SERVER_PLIST" 2>/dev/null || true
-    launchctl bootstrap "gui/${UID_NUM}" "$SERVER_PLIST" 2>/dev/null || true
-  fi
-fi
+# (Time Spent feature was removed — env var no longer needed)
 
 # Best-effort: detect terminal-notifier and warn if missing
 TN_FOUND=""

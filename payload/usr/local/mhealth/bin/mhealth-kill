@@ -2102,11 +2102,15 @@ HTML = r"""<!DOCTYPE html>
   }
   .col-cb { width: 28px; }
   .col-tab { width: 36px; color: var(--muted); }
-  /* Column resize handles */
+  /* Column resize handles — always visible as a subtle vertical bar so users
+     know columns can be dragged. Darkens on hover/drag. */
   th { position: relative; }
-  .col-resizer { position: absolute; top: 0; right: -3px; bottom: 0; width: 6px;
-                 cursor: col-resize; user-select: none; z-index: 2; }
-  .col-resizer:hover, .col-resizer.dragging { background: var(--accent); opacity: 0.5; }
+  .col-resizer { position: absolute; top: 8px; bottom: 8px; right: -1px; width: 4px;
+                 cursor: col-resize; user-select: none; z-index: 2;
+                 background: #d1d5db; border-radius: 2px; opacity: 0.7;
+                 transition: opacity 0.12s, background 0.12s; }
+  .col-resizer::after { content: ""; position: absolute; inset: -2px -8px; }  /* wider hit area */
+  .col-resizer:hover, .col-resizer.dragging { background: var(--accent); opacity: 1; width: 5px; }
   body.col-resizing { cursor: col-resize; user-select: none; }
   .pid { color: var(--muted); }
   .killing { opacity: 0.4; transition: opacity 0.3s; }
@@ -3160,13 +3164,9 @@ async function refreshSnooze() {
 refreshSnooze();
 setInterval(refreshSnooze, 30 * 1000);
 
-// Time Spent tab is hidden by default for privacy. Server injects
-// window.__ENABLE_TIME_SPENT__ based on the MHEALTH_ENABLE_TIME_SPENT env var.
-// When true, reveal the tab.
-if (window.__ENABLE_TIME_SPENT__) {
-  const t = document.getElementById("timeSpentTab");
-  if (t) t.style.display = "";
-}
+// Time Spent UI is permanently disabled. Activity logger still collects data
+// to ~/Library/Logs/mhealth-activity.csv (backend). To re-enable the tab,
+// remove this comment + style="display:none" on #timeSpentTab in the HTML.
 
 // Apple-Python health check — surface the brew-Python fix prominently so
 // teammates aren't left wondering why their TCC grants don't work.
@@ -5193,14 +5193,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         global LAST_PING
         LAST_PING = time.time()
         if self.path == "/":
-            # Inject a feature-flag script tag before </head>. Time Spent is OFF
-            # by default for privacy in distributed installs; enable via:
-            #   MHEALTH_ENABLE_TIME_SPENT=1
-            # in the launchd plist's EnvironmentVariables.
-            enable_time = os.environ.get("MHEALTH_ENABLE_TIME_SPENT") == "1"
-            flag_script = f"<script>window.__ENABLE_TIME_SPENT__={'true' if enable_time else 'false'};</script>"
-            html_out = HTML.replace("</head>", flag_script + "</head>", 1)
-            self._send(200, html_out.encode())
+            # Time Spent UI is permanently disabled. The activity logger keeps
+            # writing to ~/Library/Logs/mhealth-activity.csv (backend data),
+            # but no dashboard tab surfaces it. Re-enable in code if needed.
+            self._send(200, HTML.encode())
         elif self.path == "/data":
             payload = json.dumps({
                 "procs": cached_processes(force=True),
